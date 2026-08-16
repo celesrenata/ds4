@@ -20664,8 +20664,8 @@ int ds4_gpu_dsv4_comp_rows_update_tensor(
         [enc setBuffer:ds4_gpu_tensor_buffer(state_score)
                 offset:ds4_gpu_tensor_offset(state_score) atIndex:5];
         [enc setBuffer:normbuf offset:(NSUInteger)norm_inner atIndex:6];
-        [enc setBuffer:g_compressor_pool_softmax_buffer offset:0 atIndex:7];
-        [enc setBuffer:g_compressor_pool_product_buffer offset:0 atIndex:8];
+        [enc setBuffer:g_compressor_pool_softmax_buffer[g_ds4_stream] offset:0 atIndex:7];
+        [enc setBuffer:g_compressor_pool_product_buffer[g_ds4_stream] offset:0 atIndex:8];
         [enc setBuffer:ds4_gpu_tensor_buffer(work_t)
                 offset:ds4_gpu_tensor_offset(work_t) atIndex:9];
         [enc setBuffer:ds4_gpu_tensor_buffer(comp_cache)
