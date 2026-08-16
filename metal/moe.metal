@@ -8852,6 +8852,761 @@ kernel void kernel_attn_out_low_mpp_direct_rhs(
     }
 }
 
+// --------------------------------------------------------------------------
+// Staged-dequant TensorOps control for Q8_0 routed-expert matmul.
+//
+// Pattern: Q8_0 device blocks → dequant to threadgroup half tile
+//          Activation (scattered per-token) → staged to threadgroup half tile
+//          Both threadgroup tiles → tensor() → matmul2d
+//          → cooperative F32 accumulation → store result
+//
+// This is the BASELINE/CONTROL kernel for the custom-dequant experiment
+// (task 6.3). It uses the same staged-both-operands pattern as the existing
+// kernel_mul_mm_id_mpp for Q2_K/IQ2_XXS, but specialized for Q8_0 using
+// the optimized paired-load dequant (dequantize_q8_0_pairs).
+//
+// Routed expert activations are non-contiguous (each token in the bucket came
+// from a different position in the input batch), so both weight and activation
+// tiles must be staged to threadgroup memory before matmul2d can consume them.
+//
+// Task 6.3 will attempt to skip this threadgroup staging by feeding
+// dequantized values directly into a cooperative tensor input, potentially
+// removing one or both threadgroup round-trips.
+//
+// Tile: NR0=64 (weight rows), NK=32 (reduction), NR1=32 (activation columns)
+// Both tiles are staged each K iteration with barrier protection.
+// --------------------------------------------------------------------------
+kernel void kernel_mul_mm_id_q8_0_staged_dequant_control(
+        constant ds4_metal_args_mul_mm_id & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * htpe,
+        device const char * hids,
+        device       char * dst,
+        device const char * work,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    constexpr int NR0 = 64;   // Weight tile rows (output rows per threadgroup)
+    constexpr int NR1 = 32;   // Activation tile columns (tokens per tile)
+    constexpr int NK  = 32;   // Reduction tile (matches Q8_0 block size)
+    constexpr int NL0 = NK/16; // Sub-blocks per K step for weight dequant (=2)
+    constexpr int NL1 = NK/8;  // Sub-blocks per K step for activation staging (=4)
+
+    // Threadgroup layout: weight half tile (sa) + activation half tile (sb)
+    // sa: NR0*NK = 64*32 = 2048 half values = 4096 bytes
+    // sb: NR1*NK = 32*32 = 1024 half values = 2048 bytes
+    // Reused as float output: max(NR0*NR1*4, 4096+2048) — NR0*NR1*4 = 8192 > 6144
+    threadgroup half *sa = (threadgroup half *)shmem;
+    threadgroup half *sb = (threadgroup half *)(shmem + 4096);
+    threadgroup float *sc = (threadgroup float *)shmem; // reused for output scatter
+
+    // --- Work-item dispatch: each threadgroup processes one (expert, r1) tile ---
+    device const uint32_t *work_count = (device const uint32_t *)work;
+    const uint32_t work_index = tgpig.x;
+    if (work_index >= work_count[0]) {
+        return;
+    }
+    device const uint2 *work_items = (device const uint2 *)(work + 8);
+    const uint2 item = work_items[work_index];
+    const int im = (int)item.x;   // expert index
+    const int r1 = (int)item.y;   // token column offset within this expert's bucket
+    const int r0 = tgpig.y*NR0;   // weight row offset
+
+    device const uint32_t *tpe_u32 = (device const uint32_t *)htpe;
+    device const int32_t  *ids_i32 = (device const int32_t  *)hids;
+
+    const int32_t neh1 = tpe_u32[im]; // tokens routed to this expert
+
+    if (r1 >= neh1) {
+        return;
+    }
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
+
+    // TP ownership check: zero unowned experts to preserve downstream sums.
+    if (!ds4_tp_owns_expert(im, args.ne02, args.tp_rank, args.tp_world)) {
+        for (short j = sgitg; j < nr1; j += 4) {
+            const int idj = ids_i32[im*args.ne21 + r1 + j];
+            const short ide = idj % args.ne20;
+            const short idt = idj / args.ne20;
+            device float *D = (device float *)dst + r0 + ide*args.ne0 +
+                              idt*args.ne1*args.ne0;
+            for (int i = tiisg; i < nr0; i += 32) D[i] = 0.0f;
+        }
+        return;
+    }
+
+    // Per-thread activation source pointer (scattered based on routing ids)
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+    const short i11 = (id % args.ne20) % args.ne11;
+    const short i12 = (id / args.ne20);
+    const short iy = 8*(tiitg % NL1);
+    device const float *y = (device const float *)(src1
+        + args.nb13*0
+        + args.nb12*i12
+        + args.nb11*i11
+        + args.nb10*iy);
+
+    // Per-thread weight source pointer
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+    const uint64_t offset0 =
+        (uint64_t)(im - args.tp_expert_base)*args.nb02;
+    device const block_q8_0 *x =
+        (device const block_q8_0 *)(src0 + args.nb01*(r0 + lr0) + offset0)
+        + il0/2;  // Q8_0: nl=2, offset1 = il0/nl = 0 always (sub-block within first block)
+
+    // --- Tensor views over threadgroup tiles ---
+    auto tA = tensor(sa, dextents<int32_t, 2>(NK, NR0));
+    auto tB = tensor(sb, dextents<int32_t, 2>(NR1, NK));
+
+    // --- matmul2d descriptor: B(NR1xNK) * A(NKxNR0) → C(NR0xNR1) ---
+    matmul2d<
+        matmul2d_descriptor(NR1, NR0, NK, false, true, false,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+
+    // Zero the cooperative accumulator
+    #pragma unroll
+    for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+        if (cT.is_valid_element(i)) {
+            cT[i] = 0.0f;
+        }
+    }
+
+    // --- Main K-loop: stage both tiles, run matmul, advance pointers ---
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        // Stage weight tile: Q8_0 dequant to half using optimized paired loads.
+        // dequantize_q8_0_pairs produces half4x4 (16 half values) per call.
+        // With nl=2, each block_q8_0 (32 values) is split into 2 sub-blocks
+        // of 16 values each, addressed by il (0 or 1).
+        {
+            half4x4 temp_a;
+            dequantize_q8_0_pairs(x, il, temp_a);
+
+            // Barrier: wait for previous mm.run to finish reading tiles
+            // (harmless on first iteration)
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Store dequanted weight values to threadgroup in the layout
+            // expected by the tensor view: sa[row*NK + col]
+            FOR_UNROLL (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = i%8;
+                const short ly = (tiitg/NL0)%8;
+
+                *(sa + NK*(8*sy + ly) + 8*sx + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        // Stage activation tile: float → half from scattered per-token sources.
+        // Layout matches kernel_mul_mm_id_mpp: sb[NK*(8*sy + ly) + 8*sx + lx]
+        // where each thread writes 8 contiguous activation values.
+        {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+            const short ly = (tiitg/NL1)%8;
+
+            if (loop_k + iy + 7 < args.ne00) {
+                // Fast path: all 8 values in bounds, bulk convert float → half
+                threadgroup half *dst_sb = sb + NK*(8*sy + ly) + 8*sx;
+                FOR_UNROLL (short i = 0; i < 8; ++i) {
+                    dst_sb[i] = (half)y[i];
+                }
+            } else {
+                // Bounds-checked path for K tail
+                FOR_UNROLL (short i = 0; i < 8; ++i) {
+                    *(sb + NK*(8*sy + ly) + 8*sx + i) =
+                        (loop_k + iy + i < args.ne00) ? (half)y[i] : (half)0;
+                }
+            }
+        }
+
+        // Advance weight pointer to next K sub-block
+        il = (il + 2 < 2) ? il + 2 : il % 2; // nl=2 for Q8_0
+        x  = (il < 2) ? x + 1 : x;  // advance by one block_q8_0 each iteration
+
+        y += NK;
+
+        // Barrier: ensure all staging writes are visible before matmul reads
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto sA = tA.slice(0, 0);
+        auto sB = tB.slice(0, 0);
+        mm.run(sB, sA, cT);
+
+        // Barrier: ensure mm.run completes before next iteration overwrites tiles
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // --- Store result via routed output scatter ---
+    // Materialize cooperative result to threadgroup, then scatter to per-token
+    // output positions based on the routing ids.
+    // Note: the final loop iteration ended with a barrier after mm.run,
+    // so threadgroup memory is now available for reuse as float output buffer.
+
+    auto tC = tensor(sc, dextents<int32_t, 2>(NR0, NR1));
+    cT.store(tC);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = tiitg/32; j < nr1; j += 4) {
+        const int idj = ids_i32[im*args.ne21 + r1 + j];
+
+        const short ide = idj % args.ne20;
+        const short idt = idj / args.ne20;
+
+        device float  *D  = (device float *)dst + r0 + ide*args.ne0 + idt*args.ne1*args.ne0;
+        device float4 *D4 = (device float4 *)D;
+
+        threadgroup float  *C  = (threadgroup float *)shmem + j*NR0;
+        threadgroup float4 *C4 = (threadgroup float4 *)C;
+
+        int i = tiisg;
+        for (; i < nr0/4; i += 32) {
+            *(D4 + i) = *(C4 + i);
+        }
+
+        i = (4*(nr0/4)) + tiisg;
+        for (; i < nr0; i += 32) {
+            *(D + i) = *(C + i);
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Task 6.3 — Cooperative-input dequant CANDIDATE kernel
+// --------------------------------------------------------------------------
+//
+// KEY EXPERIMENT: Feed dequanted Q8_0 weights directly into a cooperative
+// tensor used as a matmul RIGHT input, bypassing the threadgroup weight tile.
+//
+// Comparison with the control (task 6.2):
+//   Control:  Q8_0 → dequant → threadgroup tile → tensor view → matmul2d
+//   Candidate: Q8_0 → dequant → cooperative tensor (RIGHT input) → matmul2d
+//
+// The activation tile STILL goes through threadgroup memory because routed
+// expert tokens are non-contiguous (scattered from different batch positions).
+// Only the weight path is lifted into the cooperative input.
+//
+// Memory savings: eliminates the sa[NR0*NK] = 4096 bytes threadgroup weight
+// tile.  Threadgroup is only needed for activations (sb: NR1*NK = 2048 bytes)
+// and output scatter (sc: NR0*NR1*4 = 8192 bytes, reused from sb).
+//
+// Requires: DS4_METAL_HAS_TENSOR (which implies cooperative input on macOS 26.3+ SDK)
+//           Host MUST check g_tensorops_coop_input_available before dispatching.
+//
+// Tile: NR0=64 (weight rows), NK=32 (reduction), NR1=32 (activation columns)
+// --------------------------------------------------------------------------
+// --------------------------------------------------------------------------
+// Task 6.3 BLOCKED: cooperative-input constraint discovered during validation.
+//
+// The Metal SDK enforces: "Input cooperative tensors require a single SIMD group"
+// (execution_simdgroups<1>, i.e. 32 threads per threadgroup). Our matmul tile
+// requires execution_simdgroups<4> (128 threads) to achieve the NR0=64 × NR1=32
+// output tile that matches the existing routed-expert dispatch geometry.
+//
+// With execution_simdgroups<1>, the matmul tile shrinks to roughly 16×8 or
+// similar (SDK-dependent), producing 4× more dispatches and likely losing to
+// the staged-both-operands approach in task 6.2 which uses 4 simdgroups.
+//
+// Resolution: The cooperative-input path is NOT viable for routed-expert MoE
+// with the current tile geometry. The staged-dequant control (task 6.2) remains
+// the winning mechanism for non-native quant formats. See dev-notes/6.3-coop-input-blocked.md.
+//
+// The kernel is retained below with a compile guard that prevents the build
+// error. To re-enable for experimentation with execution_simdgroups<1>, define
+// DS4_EXPERIMENT_COOP_INPUT_SINGLE_SG.
+// --------------------------------------------------------------------------
+#if defined(DS4_METAL_HAS_TENSOR) && defined(DS4_EXPERIMENT_COOP_INPUT_SINGLE_SG)
+kernel void kernel_mul_mm_id_q8_0_coop_input_candidate(
+        constant ds4_metal_args_mul_mm_id & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * htpe,
+        device const char * hids,
+        device       char * dst,
+        device const char * work,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    constexpr int NR0 = 64;   // Weight tile rows (output rows per threadgroup)
+    constexpr int NR1 = 32;   // Activation tile columns (tokens per tile)
+    constexpr int NK  = 32;   // Reduction tile (matches Q8_0 block size)
+    constexpr int NL1 = NK/8; // Sub-blocks per K step for activation staging (=4)
+
+    // Threadgroup layout: ONLY activation half tile (sb) + output scatter (sc).
+    // No weight tile needed — weights go directly into cooperative tensor.
+    // sb: NR1*NK = 32*32 = 1024 half values = 2048 bytes
+    // sc: NR0*NR1 = 64*32 = 2048 float values = 8192 bytes (reused from shmem start)
+    threadgroup half  *sb = (threadgroup half *)shmem;
+    threadgroup float *sc = (threadgroup float *)shmem; // reused for output scatter
+
+    // --- Work-item dispatch: each threadgroup processes one (expert, r1) tile ---
+    device const uint32_t *work_count = (device const uint32_t *)work;
+    const uint32_t work_index = tgpig.x;
+    if (work_index >= work_count[0]) {
+        return;
+    }
+    device const uint2 *work_items = (device const uint2 *)(work + 8);
+    const uint2 item = work_items[work_index];
+    const int im = (int)item.x;   // expert index
+    const int r1 = (int)item.y;   // token column offset within this expert's bucket
+    const int r0 = tgpig.y*NR0;   // weight row offset
+
+    device const uint32_t *tpe_u32 = (device const uint32_t *)htpe;
+    device const int32_t  *ids_i32 = (device const int32_t  *)hids;
+
+    const int32_t neh1 = tpe_u32[im]; // tokens routed to this expert
+
+    if (r1 >= neh1) {
+        return;
+    }
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
+
+    // TP ownership check: zero unowned experts to preserve downstream sums.
+    if (!ds4_tp_owns_expert(im, args.ne02, args.tp_rank, args.tp_world)) {
+        for (short j = sgitg; j < nr1; j += 4) {
+            const int idj = ids_i32[im*args.ne21 + r1 + j];
+            const short ide = idj % args.ne20;
+            const short idt = idj / args.ne20;
+            device float *D = (device float *)dst + r0 + ide*args.ne0 +
+                              idt*args.ne1*args.ne0;
+            for (int i = tiisg; i < nr0; i += 32) D[i] = 0.0f;
+        }
+        return;
+    }
+
+    // Per-thread activation source pointer (scattered based on routing ids)
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+    const short i11 = (id % args.ne20) % args.ne11;
+    const short i12 = (id / args.ne20);
+    const short iy = 8*(tiitg % NL1);
+    device const float *y = (device const float *)(src1
+        + args.nb13*0
+        + args.nb12*i12
+        + args.nb11*i11
+        + args.nb10*iy);
+
+    // --- Tensor view for activation tile (threadgroup) ---
+    auto tB = tensor(sb, dextents<int32_t, 2>(NR1, NK));
+
+    // --- matmul2d descriptor: B(NR1×NK) * A(NK×NR0) → C(NR0×NR1) ---
+    // Same geometry as the control. transpose_right=true means the right
+    // operand is stored as (NK, NR0) and transposed during matmul.
+    matmul2d<
+        matmul2d_descriptor(NR1, NR0, NK, false, true, false,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    // --- Get cooperative tensor for RIGHT input (weights) ---
+    // This is the KEY difference from the control: weights bypass threadgroup
+    // memory entirely and live in cooperative (per-thread register) storage.
+    // Template args: <LeftElementType=half, RightElementType=half, DestElementType=float>
+    auto coopA = mm.template get_right_input_cooperative_tensor<half, half, float>();
+
+    // --- Cooperative destination tensor (F32 accumulator) ---
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(coopA), float>();
+
+    // Zero the cooperative accumulator
+    #pragma unroll
+    for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+        if (cT.is_valid_element(i)) {
+            cT[i] = 0.0f;
+        }
+    }
+
+    // --- Weight base pointer (per-expert, at row r0) ---
+    const uint64_t offset0 =
+        (uint64_t)(im - args.tp_expert_base)*args.nb02;
+    device const char *weight_base = src0 + offset0;
+    // nb01 = bytes per weight row (for Q8_0: (ne00/32) * sizeof(block_q8_0))
+
+    // --- Main K-loop: stage activations to threadgroup, fill weight
+    //     cooperative tensor from dequant, run matmul ---
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+
+        // --- Stage activation tile (same as control) ---
+        // Activations are scattered: each token in the expert bucket came from
+        // a different batch position. Must gather to threadgroup.
+        {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+            const short ly = (tiitg/NL1)%8;
+
+            if (loop_k + iy + 7 < args.ne00) {
+                threadgroup half *dst_sb = sb + NK*(8*sy + ly) + 8*sx;
+                FOR_UNROLL (short i = 0; i < 8; ++i) {
+                    dst_sb[i] = (half)y[i];
+                }
+            } else {
+                FOR_UNROLL (short i = 0; i < 8; ++i) {
+                    *(sb + NK*(8*sy + ly) + 8*sx + i) =
+                        (loop_k + iy + i < args.ne00) ? (half)y[i] : (half)0;
+                }
+            }
+        }
+
+        // --- Fill cooperative weight tensor directly from Q8_0 dequant ---
+        // Each thread iterates over its cooperative tensor slots and performs
+        // random-access dequantization based on the matrix coordinates.
+        // This eliminates: threadgroup write + barrier + tensor load.
+        {
+            #pragma unroll
+            for (uint16_t ci = 0; ci < coopA.get_capacity(); ++ci) {
+                if (coopA.is_valid_element(ci)) {
+                    // Get the (k, row) position this element represents
+                    // The right operand tensor has shape (NK, NR0) with
+                    // transpose_right=true in the descriptor.
+                    auto idx = coopA.get_multidimensional_index(ci);
+                    const int k_local = idx[0];  // position within NK tile
+                    const int r_local = idx[1];  // position within NR0 tile
+
+                    const int abs_k   = loop_k + k_local;
+                    const int abs_row = r0 + r_local;
+
+                    if (abs_k < args.ne00 && abs_row < args.ne0) {
+                        // Q8_0 dequant: each block has 32 int8 values + 1 half scale
+                        const int block_idx = abs_k / 32;
+                        const int within_block = abs_k % 32;
+                        device const block_q8_0 *blk =
+                            (device const block_q8_0 *)(weight_base + args.nb01*abs_row)
+                            + block_idx;
+                        const float d = blk->d;
+                        const int8_t q = blk->qs[within_block];
+                        coopA[ci] = (half)(q * d);
+                    } else {
+                        coopA[ci] = (half)0;
+                    }
+                }
+            }
+        }
+
+        // Advance activation pointer
+        y += NK;
+
+        // Barrier: ensure activation staging writes are visible before matmul.
+        // Note: NO barrier needed for cooperative weight tensor — it's per-thread
+        // register state, not shared memory.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Run matmul: left=activation (threadgroup tensor view),
+        //             right=cooperative weights (per-thread, no staging),
+        //             dest=cooperative accumulator
+        auto sB = tB.slice(0, 0);
+        mm.run(sB, coopA, cT);
+
+        // Barrier: ensure mm.run completes before next iteration overwrites
+        // activation tile.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // --- Store result via routed output scatter ---
+    // Same pattern as control: materialize cooperative result to threadgroup,
+    // then scatter to per-token output positions based on routing ids.
+
+    auto tC = tensor(sc, dextents<int32_t, 2>(NR0, NR1));
+    cT.store(tC);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = tiitg/32; j < nr1; j += 4) {
+        const int idj = ids_i32[im*args.ne21 + r1 + j];
+
+        const short ide = idj % args.ne20;
+        const short idt = idj / args.ne20;
+
+        device float  *D  = (device float *)dst + r0 + ide*args.ne0 + idt*args.ne1*args.ne0;
+        device float4 *D4 = (device float4 *)D;
+
+        threadgroup float  *C  = (threadgroup float *)shmem + j*NR0;
+        threadgroup float4 *C4 = (threadgroup float4 *)C;
+
+        int i = tiisg;
+        for (; i < nr0/4; i += 32) {
+            *(D4 + i) = *(C4 + i);
+        }
+
+        i = (4*(nr0/4)) + tiisg;
+        for (; i < nr0; i += 32) {
+            *(D + i) = *(C + i);
+        }
+    }
+}
+#endif // DS4_EXPERIMENT_COOP_INPUT_SINGLE_SG (cooperative-input candidate)
+
+// --------------------------------------------------------------------------
+// Task 7.3 — TensorOps pair+SwiGLU gate/up kernel for Q4_K
+// --------------------------------------------------------------------------
+//
+// Combines the staged-dequant TensorOps mechanism (winning from task 6.5) with
+// the paired gate+up SwiGLU epilogue from kernel_mul_mm_id_pair_swiglu_f16_impl.
+//
+// Q8_0 SKIP: Q8_0 is NOT used for MoE expert weights in DS4 Flash. It is used
+// only for attention output low-rank projections (already covered by
+// kernel_attn_out_low_q8_0_mpp_direct_rhs_n64). No Q8_0 MoE gate/up TensorOps
+// kernel is created.
+//
+// Q4_K: Used for MoE expert gate/up in DS4 quantized configurations. This
+// kernel lifts the existing simdgroup kernel_mul_mm_id_q4_K_pair_swiglu_f16
+// to TensorOps/matmul2d, exercising the M5 Neural Accelerator.
+//
+// Structure:
+//   - Two weight tiles staged per K iteration (gate + up) sharing one
+//     activation tile
+//   - Two cooperative accumulators (gate + up)
+//   - matmul2d run twice per K step against the shared activation tile
+//   - SwiGLU epilogue: clamp, SiLU, multiply, route weight → half mid output
+//
+// Tile: NR0=64, NR1=32, NK=32, execution_simdgroups<4>
+// Threadgroup memory: max(4096+4096+2048, 8192+8192) = max(10240, 16384)
+//                     = 16384 bytes (output phase needs 2×NR0×NR1×4)
+//
+// Reuses: dequantize_q4_K (existing dense dequant logic from moe.metal)
+// Does NOT duplicate decoder semantics.
+// --------------------------------------------------------------------------
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_mul_mm_id_pair_swiglu_mpp(
+        constant ds4_metal_args_mul_mm_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device const char * htpe,
+        device const char * hids,
+        device       char * dst_mid,
+        device const char * weights,
+        device const char * work,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    constexpr int NR0 = 64;   // Weight tile rows (output rows per threadgroup)
+    constexpr int NR1 = 32;   // Activation tile columns (tokens per tile)
+    constexpr int NK  = 32;   // Reduction tile
+    constexpr int NL0 = NK/16; // Sub-blocks per K step for weight dequant (=2)
+    constexpr int NL1 = NK/8;  // Sub-blocks per K step for activation staging (=4)
+
+    // Threadgroup memory layout during K-loop:
+    //   sa_gate: half[NR0*NK] = 4096 bytes (gate weight tile)
+    //   sa_up:   half[NR0*NK] = 4096 bytes (up weight tile)
+    //   sb:      half[NR1*NK] = 2048 bytes (shared activation tile)
+    //   Total staging: 10240 bytes
+    //
+    // Threadgroup memory layout during output:
+    //   temp_gate: float[NR0*NR1] = 8192 bytes
+    //   temp_up:   float[NR0*NR1] = 8192 bytes
+    //   Total output: 16384 bytes (dominates; host sets this size)
+    threadgroup half *sa_gate = (threadgroup half *)shmem;
+    threadgroup half *sa_up   = (threadgroup half *)(shmem + 4096);
+    threadgroup half *sb      = (threadgroup half *)(shmem + 8192);
+
+    // --- Work-item dispatch ---
+    device const uint32_t *work_count = (device const uint32_t *)work;
+    const uint32_t work_index = tgpig.x;
+    if (work_index >= work_count[0]) {
+        return;
+    }
+    device const uint2 *work_items = (device const uint2 *)(work + 8);
+    const uint2 item = work_items[work_index];
+    const int im = (int)item.x;   // expert index
+    const int r0 = tgpig.y*NR0;   // weight row offset
+    const int r1 = (int)item.y;   // token column offset within expert bucket
+
+    device const uint32_t *tpe_u32 = (device const uint32_t *)htpe;
+    device const int32_t  *ids_i32 = (device const int32_t  *)hids;
+
+    const int32_t neh1 = tpe_u32[im]; // tokens routed to this expert
+
+    if (r1 >= neh1) {
+        return;
+    }
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
+
+    // Per-thread pointer setup (identical to pair_swiglu_f16_impl)
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+
+    const short i11 = (id % args.ne20) % args.ne11;
+    const short i12 = (id / args.ne20);
+    const short i13 = 0;
+
+    const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
+    const short    offset1 = il0/nl;
+
+    device const block_q *xg =
+        (device const block_q *)(src0_gate + args.nb01*(r0 + lr0) + offset0) + offset1;
+    device const block_q *xu =
+        (device const block_q *)(src0_up + args.nb01*(r0 + lr0) + offset0) + offset1;
+
+    const short iy = 8*(tiitg % NL1);
+
+    device const float *y = (device const float *)(src1
+        + args.nb13*i13
+        + args.nb12*i12
+        + args.nb11*i11
+        + args.nb10*iy);
+
+    // --- TensorOps setup ---
+    // Tensor views over threadgroup tiles: same layout as kernel_mul_mm_id_mpp
+    auto tA_gate = tensor(sa_gate, dextents<int32_t, 2>(NK, NR0));
+    auto tA_up   = tensor(sa_up,   dextents<int32_t, 2>(NK, NR0));
+    auto tB      = tensor(sb,      dextents<int32_t, 2>(NR1, NK));
+
+    // matmul2d descriptor: B(NR1×NK) × A(NK×NR0)^T → C(NR0×NR1)
+    matmul2d<
+        matmul2d_descriptor(NR1, NR0, NK, false, true, false,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    // Two separate cooperative accumulators for gate and up
+    auto cT_gate = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA_gate), float>();
+    auto cT_up   = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA_up), float>();
+
+    // Zero both accumulators
+    #pragma unroll
+    for (uint16_t i = 0; i < cT_gate.get_capacity(); ++i) {
+        if (cT_gate.is_valid_element(i)) {
+            cT_gate[i] = 0.0f;
+        }
+    }
+    #pragma unroll
+    for (uint16_t i = 0; i < cT_up.get_capacity(); ++i) {
+        if (cT_up.is_valid_element(i)) {
+            cT_up[i] = 0.0f;
+        }
+    }
+
+    // --- Main K-loop ---
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        // Dequant both weight tiles
+        half4x4 temp_gate;
+        dequantize_func(xg, il, temp_gate);
+        half4x4 temp_up;
+        dequantize_func(xu, il, temp_up);
+
+        // Barrier: wait for previous mm.run to finish reading tiles
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Stage gate weight tile to sa_gate
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+            const short lx = i%8;
+            const short ly = (tiitg/NL0)%8;
+
+            *(sa_gate + NK*(8*sy + ly) + 8*sx + lx) = temp_gate[i/4][i%4];
+            *(sa_up   + NK*(8*sy + ly) + 8*sx + lx) = temp_up[i/4][i%4];
+        }
+
+        // Stage activation tile: float → half from scattered per-token sources
+        {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+            const short ly = (tiitg/NL1)%8;
+
+            *(threadgroup half2x4 *)(sb + NK*(8*sy + ly) + 8*sx) =
+                (half2x4)(*((device float2x4 *) y));
+        }
+
+        // Advance weight pointers
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        xg = (il < 2) ? xg + (2 + nl - 1)/nl : xg;
+        xu = (il < 2) ? xu + (2 + nl - 1)/nl : xu;
+        y += NK;
+
+        // Barrier: ensure all staging writes are visible before matmul reads
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Run matmul2d twice: once for gate weights, once for up weights,
+        // both against the shared activation tile
+        auto sA_gate = tA_gate.slice(0, 0);
+        auto sA_up   = tA_up.slice(0, 0);
+        auto sB      = tB.slice(0, 0);
+        mm.run(sB, sA_gate, cT_gate);
+        mm.run(sB, sA_up,   cT_up);
+
+        // Barrier: ensure mm.run completes before next iteration overwrites tiles
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // --- Store cooperative results to threadgroup and apply SwiGLU epilogue ---
+    threadgroup float *temp_gate = (threadgroup float *)shmem;
+    threadgroup float *temp_up   = temp_gate + NR0*NR1;
+
+    auto tC_gate = tensor(temp_gate, dextents<int32_t, 2>(NR0, NR1));
+    auto tC_up   = tensor(temp_up,   dextents<int32_t, 2>(NR0, NR1));
+    cT_gate.store(tC_gate);
+    cT_up.store(tC_up);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // SwiGLU epilogue: matches kernel_mul_mm_id_pair_swiglu_f16_impl exactly
+    const float c = act.clamp_value;
+    for (short j = sgitg; j < nr1; j += 4) {
+        const int idj = ids_i32[im*args.ne21 + r1 + j];
+
+        const short ide = idj % args.ne20;
+        const short idt = idj / args.ne20;
+
+        device half *D = (device half *)(dst_mid +
+            ((uint64_t)idt*args.ne1 + (uint64_t)ide)*act.mid_row_stride) + r0;
+        device const float *w = (device const float *)(weights + (uint64_t)idj*act.weight_stride);
+        const float route_weight = w[0];
+
+        threadgroup float *Cg = temp_gate + j*NR0;
+        threadgroup float *Cu = temp_up   + j*NR0;
+
+        int i = tiisg;
+        for (; i < nr0; i += 32) {
+            float g = Cg[i];
+            float u = Cu[i];
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            D[i] = (half)(silu * u * route_weight);
+        }
+    }
+}
+
+// Q4_K TensorOps pair+SwiGLU instantiation
+typedef decltype(kernel_mul_mm_id_pair_swiglu_mpp<block_q4_K, QK_NL, dequantize_q4_K>) mul_mm_id_pair_swiglu_mpp_q4_t;
+
+template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_mpp")]]
+kernel mul_mm_id_pair_swiglu_mpp_q4_t
+kernel_mul_mm_id_pair_swiglu_mpp<block_q4_K, QK_NL, dequantize_q4_K>;
+
+// Host-visible export for the staged-dequant Q8_0 TensorOps control kernel.
+// This is NOT a template — it is a single non-generic kernel that the host
+// references by its [[host_name]] directly.
+
 // Routed-expert grouped matmul on the Metal4 TensorOps/MPP pipeline. The
 // barrier after mm.run prevents the next K iteration from replacing staged
 // tiles while the cooperative matmul still reads them.
@@ -9059,6 +9814,312 @@ template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp")]] kernel mul_mm_id_mpp_
 template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp")]]    kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp")]] kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;
 
+// Task 8.2: MXFP4 and Q4_K down-projection TensorOps instantiations.
+// Same staged-dequant → threadgroup → matmul2d pattern as Q2_K/IQ2_XXS above.
+// The down kernel writes per-expert per-token results; the subsequent sum kernel
+// (kernel_dsv4_moe_sum6_f32) is unchanged. Expert ownership and streaming
+// semantics are preserved by the kernel_mul_mm_id_mpp template itself.
+template [[host_name("kernel_mul_mm_id_mxfp4_f16_mpp")]]   kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_q4_K_f16_mpp")]]    kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half, half4x4, half, half2x4>;
+
+// ==========================================================================
+// Task 7.4 — TensorOps routed-MoE gate/up FUSION prototype
+// ==========================================================================
+//
+// GOAL: Fuse the gate and up projections into a single TensorOps kernel that
+//       shares one staged activation tile, runs two matmul2d operations, and
+//       applies SwiGLU + route weighting on the cooperative results before a
+//       single device store of only `mid`.
+//
+// This is the TensorOps analogue of the existing simdgroup-matrix
+// kernel_mul_mm_id_pair_swiglu_f16_impl. It reuses the frozen staged-dequant
+// mechanism from task 6.5 (kernel_mul_mm_id_mpp) but carries TWO cooperative
+// F32 destinations concurrently — one for gate, one for up — accumulated over
+// the same activation tile.
+//
+// Dataflow per work item (one (expert, token-column) tile):
+//
+//     activation (device, scattered) ──► sb[]  (staged ONCE per K-step)
+//                                          │  (shared by both matmuls)
+//                        ┌────────────────┴────────────────┐
+//     gate weights ─► sa_gate[] ─► tA_gate                 │
+//                                    │  matmul2d            │
+//                                    ▼                      ▼
+//                                 cT_gate                cT_up
+//                                    │                      │
+//                                    └──────► store ◄───────┘  (threadgroup)
+//                                             │
+//                                    mid = SiLU(clamp(gate)) * clamp(up) * w
+//                                             │
+//                                             ▼
+//                                      dst_mid (device, only `mid`)
+//
+// Design §8.6 questions answered by this prototype:
+//   Q1: Two cooperative destinations from matching descriptors CAN coexist —
+//       each is created from the shared matmul2d descriptor and indexed with
+//       the same per-thread mapping (cooperative store to a threadgroup tile
+//       resolves the mapping uniformly, exactly as the single-output kernel).
+//   Q2: Gate and up run back-to-back per K-step while the shared activation
+//       tile (sb) stays hot in threadgroup memory — no re-staging, no extra
+//       barrier between the two mm.run() calls (neither writes threadgroup).
+//   Q3: Storing only `mid` is valid for the production graph — normal
+//       inference does not consume gate/up after SwiGLU (matches the existing
+//       simdgroup pair kernel; a debug switch elsewhere can restore them).
+//   Q4: Route weight is fused in the SAME epilogue position as the simdgroup
+//       kernel (silu * up * route_weight), preserving arithmetic order.
+//   Q5: Register pressure — two cooperative F32 accumulators double the
+//       accumulator register footprint. See dev-notes/7.4 for the paired-vs-
+//       sequential analysis and the fallback below (DS4_MOE_FUSION_SEQUENTIAL).
+//
+// Tile: NR0=64 (weight rows/output dim), NR1=32 (tokens), NK=32 (reduction).
+// Threadgroup bytes:
+//   staging:  sa_gate 4096 + sa_up 4096 + sb 2048 = 10240
+//   epilogue: sc_gate 8192 + sc_up 8192           = 16384 (reuses shmem)
+//   required: max(10240, 16384) = 16384 bytes
+// --------------------------------------------------------------------------
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_mul_mm_id_mpp_pair_swiglu_f16_impl(
+        constant ds4_metal_args_mul_mm_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device const char * htpe,
+        device const char * hids,
+        device       char * dst_mid,
+        device const char * weights,
+        device const char * work,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    constexpr int NR0 = 64;   // Weight tile rows (output dim per threadgroup)
+    constexpr int NR1 = 32;   // Activation tile columns (tokens per tile)
+    constexpr int NK  = 32;   // Reduction tile
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    // Staging tiles: two weight tiles + one shared activation tile.
+    threadgroup half *sa_gate = (threadgroup half *)(shmem);
+    threadgroup half *sa_up   = (threadgroup half *)(shmem + 4096);
+    threadgroup half *sb      = (threadgroup half *)(shmem + 8192);
+
+    // --- Work-item dispatch: one (expert, token-column) tile per threadgroup ---
+    device const uint32_t *work_count = (device const uint32_t *)work;
+    const uint32_t work_index = tgpig.x;
+    if (work_index >= work_count[0]) {
+        return;
+    }
+    device const uint2 *work_items = (device const uint2 *)(work + 8);
+    const uint2 item = work_items[work_index];
+    const int im = (int)item.x;
+    const int r0 = tgpig.y*NR0;
+    const int r1 = (int)item.y;
+
+    device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
+    device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
+
+    const int32_t neh1 = tpe_u32[im];
+
+    if (r1 >= neh1) {
+        return;
+    }
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
+
+    // TP ownership: unowned experts zero their `mid` output region and return
+    // so downstream expert-sum stages remain correct.
+    if (!ds4_tp_owns_expert(im, args.ne02, args.tp_rank, args.tp_world)) {
+        for (short j = sgitg; j < nr1; j += 4) {
+            const int idj = ids_i32[im*args.ne21 + r1 + j];
+            const short ide = idj % args.ne20;
+            const short idt = idj / args.ne20;
+            device half *D = (device half *)(dst_mid +
+                ((uint64_t)idt*args.ne1 + (uint64_t)ide)*act.mid_row_stride) + r0;
+            for (int i = tiisg; i < nr0; i += 32) D[i] = (half)0;
+        }
+        return;
+    }
+
+    // Per-thread staging source pointers (weights + scattered activation).
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+
+    const short i11 = (id % args.ne20) % args.ne11;
+    const short i12 = (id / args.ne20);
+    const short i13 = 0;
+
+    const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
+    const short    offset1 = il0/nl;
+
+    device const block_q * xg =
+        (device const block_q *)(src0_gate + args.nb01*(r0 + lr0) + offset0) + offset1;
+    device const block_q * xu =
+        (device const block_q *)(src0_up + args.nb01*(r0 + lr0) + offset0) + offset1;
+
+    const short iy = 8*(tiitg % NL1);
+
+    device const float * y = (device const float *)(src1
+        + args.nb13*i13
+        + args.nb12*i12
+        + args.nb11*i11
+        + args.nb10*iy);
+
+    // --- Tensor views: one per weight tile, one shared activation view ---
+    auto tA_gate = tensor(sa_gate, dextents<int32_t, 2>(NK, NR0));
+    auto tA_up   = tensor(sa_up,   dextents<int32_t, 2>(NK, NR0));
+    auto tB      = tensor(sb,      dextents<int32_t, 2>(NR1, NK));
+
+    // Single matmul2d descriptor reused for both projections: they share tile
+    // geometry (only the A operand and cooperative destination differ).
+    matmul2d<
+        matmul2d_descriptor(NR1, NR0, NK, false, true, false,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    // TWO cooperative F32 destinations carried concurrently across the K-loop.
+    auto cT_gate = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA_gate), float>();
+    auto cT_up   = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA_up),   float>();
+
+    #pragma unroll
+    for (uint16_t i = 0; i < cT_gate.get_capacity(); ++i) {
+        if (cT_gate.is_valid_element(i)) {
+            cT_gate[i] = 0.0f;
+        }
+    }
+    #pragma unroll
+    for (uint16_t i = 0; i < cT_up.get_capacity(); ++i) {
+        if (cT_up.is_valid_element(i)) {
+            cT_up[i] = 0.0f;
+        }
+    }
+
+    // --- Main K-loop: stage BOTH weight tiles + shared activation, then run
+    //     both matmul2d ops back-to-back on the hot activation tile. ---
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        half4x4 temp_gate;
+        dequantize_func(xg, il, temp_gate);
+        half4x4 temp_up;
+        dequantize_func(xu, il, temp_up);
+
+        // Barrier: wait for the previous iteration's matmuls to finish reading
+        // the tiles before overwriting them (harmless on the first iteration).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Stage both weight tiles in one pass (same layout as the mpp kernel).
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+            const short lx = i%8;
+            const short ly = (tiitg/NL0)%8;
+
+            *(sa_gate + NK*(8*sy + ly) + 8*sx + lx) = temp_gate[i/4][i%4];
+            *(sa_up   + NK*(8*sy + ly) + 8*sx + lx) = temp_up[i/4][i%4];
+        }
+
+        // Stage the shared activation tile ONCE (both matmuls read it).
+        {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+            const short ly = (tiitg/NL1)%8;
+
+            if (loop_k + iy + 7 < args.ne00) {
+                threadgroup half *dst_sb = sb + NK*(8*sy + ly) + 8*sx;
+                FOR_UNROLL (short i = 0; i < 8; ++i) {
+                    dst_sb[i] = (half)y[i];
+                }
+            } else {
+                FOR_UNROLL (short i = 0; i < 8; ++i) {
+                    *(sb + NK*(8*sy + ly) + 8*sx + i) =
+                        (loop_k + iy + i < args.ne00) ? (half)y[i] : (half)0;
+                }
+            }
+        }
+
+        // Advance staging pointers.
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        xg = (il < 2) ? xg + (2 + nl - 1)/nl : xg;
+        xu = (il < 2) ? xu + (2 + nl - 1)/nl : xu;
+        y += NK;
+
+        // Barrier: ensure all staging writes are visible before the matmuls.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto sA_gate = tA_gate.slice(0, 0);
+        auto sA_up   = tA_up.slice(0, 0);
+        auto sB      = tB.slice(0, 0);
+
+        // Both matmuls consume the SAME activation slice. Neither writes
+        // threadgroup memory, so no barrier is needed between them; the
+        // activation tile stays valid for the second run.
+        mm.run(sB, sA_gate, cT_gate);
+        mm.run(sB, sA_up,   cT_up);
+
+        // Barrier: ensure both matmuls finish before the next iteration
+        // overwrites the staging tiles.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Fusion epilogue: store both cooperative results to threadgroup,
+    //     apply clamp/SiLU/multiply/route-weight, write only `mid` to device. ---
+    threadgroup float *sc_gate = (threadgroup float *)shmem;
+    threadgroup float *sc_up   = sc_gate + NR0*NR1;
+
+    auto tC_gate = tensor(sc_gate, dextents<int32_t, 2>(NR0, NR1));
+    auto tC_up   = tensor(sc_up,   dextents<int32_t, 2>(NR0, NR1));
+    cT_gate.store(tC_gate);
+    cT_up.store(tC_up);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float c = act.clamp_value;
+    for (short j = sgitg; j < nr1; j += 4) {
+        const int idj = ids_i32[im*args.ne21 + r1 + j];
+
+        const short ide = idj % args.ne20;
+        const short idt = idj / args.ne20;
+
+        device half *D = (device half *)(dst_mid +
+            ((uint64_t)idt*args.ne1 + (uint64_t)ide)*act.mid_row_stride) + r0;
+        device const float *w = (device const float *)(weights + (uint64_t)idj*act.weight_stride);
+        const float route_weight = w[0];
+
+        threadgroup float *Cg = sc_gate + j*NR0;
+        threadgroup float *Cu = sc_up   + j*NR0;
+
+        int i = tiisg;
+        for (; i < nr0; i += 32) {
+            float g = Cg[i];
+            float u = Cu[i];
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            D[i] = (half)(silu * u * route_weight);
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_id_mpp_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>) mul_mm_id_mpp_pair_swiglu_iq2_t;
+typedef decltype(kernel_mul_mm_id_mpp_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K>) mul_mm_id_mpp_pair_swiglu_q4_t;
+typedef decltype(kernel_mul_mm_id_mpp_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4>) mul_mm_id_mpp_pair_swiglu_mxfp4_t;
+
+template [[host_name("kernel_mul_mm_id_iq2_xxs_mpp_pair_swiglu_f16")]] kernel mul_mm_id_mpp_pair_swiglu_iq2_t kernel_mul_mm_id_mpp_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
+template [[host_name("kernel_mul_mm_id_q4_K_mpp_pair_swiglu_f16")]]    kernel mul_mm_id_mpp_pair_swiglu_q4_t  kernel_mul_mm_id_mpp_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_mul_mm_id_mxfp4_mpp_pair_swiglu_f16")]]   kernel mul_mm_id_mpp_pair_swiglu_mxfp4_t kernel_mul_mm_id_mpp_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4>;
+template [[host_name("kernel_mul_mm_id_mxfp4_mpp_pair_swiglu_f16_half_scale")]] kernel mul_mm_id_mpp_pair_swiglu_mxfp4_t kernel_mul_mm_id_mpp_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4_half_scale>;
+
 typedef decltype(kernel_attn_out_low_mpp_direct_rhs<
         block_q8_0, 2, dequantize_q8_0_pairs, 64>)
     attn_out_low_q8_0_mpp_direct_rhs_n64_t;
@@ -9074,6 +10135,15 @@ template [[host_name("kernel_attn_out_low_q4_K_mpp_direct_rhs_n64")]]
 kernel attn_out_low_q4_K_mpp_direct_rhs_n64_t
 kernel_attn_out_low_mpp_direct_rhs<
         block_q4_K, QK_NL, dequantize_q4_K, 64>;
+
+// Task 7.2: MXFP4 TensorOps pair+SwiGLU instantiation.
+// Uses the staged-dequant kernel_mul_mm_id_mpp_pair_swiglu_f16_impl template
+// with dequantize_mxfp4 (float-domain E8M0 scale × E2M1 LUT decode).
+// Already instantiated above as "kernel_mul_mm_id_mxfp4_mpp_pair_swiglu_f16"
+// from kernel_mul_mm_id_mpp_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4>.
+// Falls back to the legacy simdgroup kernel_mul_mm_id_mxfp4_pair_swiglu_f16
+// when TensorOps is unavailable or disabled.
+// Host dispatch references "kernel_mul_mm_id_mxfp4_mpp_pair_swiglu_f16" directly.
 
 #endif
 

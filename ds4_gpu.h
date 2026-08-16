@@ -9,6 +9,45 @@ extern "C" {
 #endif
 
 /* =========================================================================
+ * Compile-time TensorOps feature-tier macros.
+ *
+ * DS4_METAL_HAS_TENSOR is injected at Metal library compile time via
+ * MTLCompileOptions preprocessorMacros — it gates shader-level TensorOps.
+ *
+ * The host-side SDK tier macros below gate Objective-C / Metal API usage that
+ * requires headers from a particular macOS SDK.  They allow the legacy Metal
+ * backend to build unchanged on older SDKs.
+ * =========================================================================
+ */
+#if defined(__APPLE__) && defined(__MAC_OS_X_VERSION_MAX_ALLOWED)
+# if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+#  define DS4_METAL_SDK_TENSOROPS 1          /* basic tensor / matmul2d */
+# endif
+# if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260300
+#  define DS4_METAL_SDK_COOP_INPUT 1         /* cooperative tensor as matmul input */
+# endif
+# if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
+#  define DS4_METAL_SDK_NATIVE_INT 1         /* native int4/int8 tensor types */
+# endif
+# if __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
+#  define DS4_METAL_SDK_NATIVE_LOWBIT 1      /* low-bit float, E8M0, MX formats */
+# endif
+#endif
+
+#ifndef DS4_METAL_SDK_TENSOROPS
+# define DS4_METAL_SDK_TENSOROPS 0
+#endif
+#ifndef DS4_METAL_SDK_COOP_INPUT
+# define DS4_METAL_SDK_COOP_INPUT 0
+#endif
+#ifndef DS4_METAL_SDK_NATIVE_INT
+# define DS4_METAL_SDK_NATIVE_INT 0
+#endif
+#ifndef DS4_METAL_SDK_NATIVE_LOWBIT
+# define DS4_METAL_SDK_NATIVE_LOWBIT 0
+#endif
+
+/* =========================================================================
  * GPU Tensor and Command Lifetime.
  * =========================================================================
  *
@@ -2861,6 +2900,70 @@ int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
+
+/* =========================================================================
+ * TensorOps Runtime Capability and Diagnostics (Tasks 2.2–2.4).
+ * =========================================================================
+ *
+ * Runtime capability queries.  On non-Apple builds all return 0.
+ * These are cheap (static-global reads) and safe to call from any thread
+ * after ds4_gpu_init() returns.
+ */
+#ifdef __APPLE__
+int ds4_gpu_tensorops_compiled(void);
+int ds4_gpu_tensorops_runtime(void);
+int ds4_gpu_tensorops_m5_neural_accelerator(void);
+int ds4_gpu_tensorops_coop_input(void);
+int ds4_gpu_tensorops_native_int4_int8(void);
+int ds4_gpu_tensorops_native_lowbit_float(void);
+int ds4_gpu_tensorops_native_e8m0_scale(void);
+
+/* Print capability summary to stderr.  Only emits when diagnostics are
+ * requested (DS4_METAL_TENSOROPS_DIAG=1). */
+void ds4_gpu_tensorops_print_caps(void);
+
+/* Print dispatch/fallback counters to stderr.  Only emits when diagnostics
+ * are requested. */
+void ds4_gpu_tensorops_print_counters(void);
+
+/* Reset all dispatch/fallback counters to zero. */
+void ds4_gpu_tensorops_reset_counters(void);
+
+/* Individual counter accessors for testing. */
+uint64_t ds4_gpu_tensorops_counter_dense(void);
+uint64_t ds4_gpu_tensorops_counter_indexer(void);
+uint64_t ds4_gpu_tensorops_counter_moe_gate_up(void);
+uint64_t ds4_gpu_tensorops_counter_moe_down(void);
+uint64_t ds4_gpu_tensorops_counter_verify(void);
+uint64_t ds4_gpu_tensorops_counter_fallback_shape(void);
+uint64_t ds4_gpu_tensorops_counter_fallback_quant(void);
+uint64_t ds4_gpu_tensorops_counter_fallback_alignment(void);
+uint64_t ds4_gpu_tensorops_counter_fallback_os(void);
+uint64_t ds4_gpu_tensorops_counter_fallback_pipeline(void);
+uint64_t ds4_gpu_tensorops_counter_fallback_streaming(void);
+#else
+static inline int ds4_gpu_tensorops_compiled(void) { return 0; }
+static inline int ds4_gpu_tensorops_runtime(void) { return 0; }
+static inline int ds4_gpu_tensorops_m5_neural_accelerator(void) { return 0; }
+static inline int ds4_gpu_tensorops_coop_input(void) { return 0; }
+static inline int ds4_gpu_tensorops_native_int4_int8(void) { return 0; }
+static inline int ds4_gpu_tensorops_native_lowbit_float(void) { return 0; }
+static inline int ds4_gpu_tensorops_native_e8m0_scale(void) { return 0; }
+static inline void ds4_gpu_tensorops_print_caps(void) {}
+static inline void ds4_gpu_tensorops_print_counters(void) {}
+static inline void ds4_gpu_tensorops_reset_counters(void) {}
+static inline uint64_t ds4_gpu_tensorops_counter_dense(void) { return 0; }
+static inline uint64_t ds4_gpu_tensorops_counter_indexer(void) { return 0; }
+static inline uint64_t ds4_gpu_tensorops_counter_moe_gate_up(void) { return 0; }
+static inline uint64_t ds4_gpu_tensorops_counter_moe_down(void) { return 0; }
+static inline uint64_t ds4_gpu_tensorops_counter_verify(void) { return 0; }
+static inline uint64_t ds4_gpu_tensorops_counter_fallback_shape(void) { return 0; }
+static inline uint64_t ds4_gpu_tensorops_counter_fallback_quant(void) { return 0; }
+static inline uint64_t ds4_gpu_tensorops_counter_fallback_alignment(void) { return 0; }
+static inline uint64_t ds4_gpu_tensorops_counter_fallback_os(void) { return 0; }
+static inline uint64_t ds4_gpu_tensorops_counter_fallback_pipeline(void) { return 0; }
+static inline uint64_t ds4_gpu_tensorops_counter_fallback_streaming(void) { return 0; }
+#endif
 
 #ifdef __cplusplus
 }

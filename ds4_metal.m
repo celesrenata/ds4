@@ -15,6 +15,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <stdatomic.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
@@ -489,6 +490,29 @@ static int g_metal4_m5_neural_accelerators_hint;
 static int g_metal4_tensor_api_enabled;
 static int g_metal4_tensor_api_compile_supported;
 static char g_metal_device_name[128];
+
+/* TensorOps extended capability flags (Task 2.2). */
+static int g_tensorops_coop_input_available;
+static int g_tensorops_native_int4_int8_available;
+static int g_tensorops_native_lowbit_float_available;
+static int g_tensorops_native_e8m0_scale_available;
+
+/* Global rollback: DS4_METAL_DISABLE_TENSOROPS dominates all enables (Task 2.4). */
+static int g_tensorops_global_rollback;
+
+/* Dispatch/fallback counters (Task 2.3).  Atomics with relaxed ordering —
+ * negligible overhead for normal runs; read only during diagnostics. */
+static _Atomic uint64_t g_ctr_dense_tensorops;
+static _Atomic uint64_t g_ctr_indexer_tensorops;
+static _Atomic uint64_t g_ctr_moe_gate_up_tensorops;
+static _Atomic uint64_t g_ctr_moe_down_tensorops;
+static _Atomic uint64_t g_ctr_verify_tensorops;
+static _Atomic uint64_t g_ctr_fallback_shape;
+static _Atomic uint64_t g_ctr_fallback_quant;
+static _Atomic uint64_t g_ctr_fallback_alignment;
+static _Atomic uint64_t g_ctr_fallback_os;
+static _Atomic uint64_t g_ctr_fallback_pipeline;
+static _Atomic uint64_t g_ctr_fallback_streaming;
 static int ds4_gpu_model_map_log_enabled(void);
 static int ds4_gpu_stream_expert_cache_note_expert_size(
         uint64_t gate_expert_bytes,
@@ -2512,6 +2536,231 @@ static void ds4_gpu_detect_metal4_features(void) {
         }
     }
 #endif
+}
+
+/* =========================================================================
+ * TensorOps extended capability detection (Task 2.2).
+ *
+ * Called from ds4_gpu_init() after ds4_gpu_detect_metal4_features().
+ * Probes higher OS/SDK tiers: cooperative tensor input (macOS 26.3),
+ * native int4/int8 (macOS 26.4), and low-bit float / E8M0 (macOS 27).
+ * =========================================================================
+ */
+static void ds4_gpu_detect_tensorops_tiers(void) {
+    g_tensorops_coop_input_available = 0;
+    g_tensorops_native_int4_int8_available = 0;
+    g_tensorops_native_lowbit_float_available = 0;
+    g_tensorops_native_e8m0_scale_available = 0;
+
+    if (!g_metal4_tensor_api_enabled) return;
+
+#if DS4_METAL_SDK_COOP_INPUT
+    if (@available(macOS 26.3, *)) {
+        g_tensorops_coop_input_available = 1;
+    }
+#endif
+
+#if DS4_METAL_SDK_NATIVE_INT
+    if (@available(macOS 26.4, *)) {
+        g_tensorops_native_int4_int8_available = 1;
+    }
+#endif
+
+#if DS4_METAL_SDK_NATIVE_LOWBIT
+    if (@available(macOS 27.0, *)) {
+        g_tensorops_native_lowbit_float_available = 1;
+        g_tensorops_native_e8m0_scale_available = 1;
+    }
+#endif
+}
+
+/* =========================================================================
+ * Global rollback control (Task 2.4).
+ *
+ * DS4_METAL_DISABLE_TENSOROPS is checked once at init.  When set, it zeros
+ * all TensorOps capability flags, dominating any individual force-enables.
+ * =========================================================================
+ */
+static void ds4_gpu_apply_tensorops_rollback(void) {
+    g_tensorops_global_rollback = ds4_gpu_env_bool("DS4_METAL_DISABLE_TENSOROPS") > 0;
+    if (!g_tensorops_global_rollback) return;
+
+    g_metal4_tensor_api_enabled = 0;
+    g_tensorops_coop_input_available = 0;
+    g_tensorops_native_int4_int8_available = 0;
+    g_tensorops_native_lowbit_float_available = 0;
+    g_tensorops_native_e8m0_scale_available = 0;
+}
+
+/* =========================================================================
+ * Measured crossover dispatch (Task 10.3).
+ *
+ * DS4_METAL_TENSOROPS_CROSSOVER_N overrides the default mm_id threshold
+ * (N>=32) for benchmarking lower crossover points on M5 hardware.
+ *
+ * Invariants:
+ *   - Batch-1 decode (N=1) NEVER uses mm_id (R10).
+ *   - N<=5 uses the tiny pair path when available (checked separately).
+ *   - Minimum override value is 6 (protects the tiny pair zone).
+ *
+ * Once task 10.2 benchmarks determine the optimal threshold, the default
+ * will be updated to the measured value for M5 hardware.
+ * =========================================================================
+ */
+static uint32_t ds4_gpu_moe_mm_id_threshold(void) {
+    static uint32_t threshold = 0;
+    static bool initialized = false;
+    if (!initialized) {
+        const char *env = getenv("DS4_METAL_TENSOROPS_CROSSOVER_N");
+        if (env) {
+            int val = atoi(env);
+            threshold = val >= 6 ? (uint32_t)val : 6u;
+        } else {
+            threshold = 32u; /* default: pending 10.2 measurement */
+        }
+        initialized = true;
+    }
+    return threshold;
+}
+
+/* =========================================================================
+ * Public capability accessors (Task 2.2).
+ * =========================================================================
+ */
+int ds4_gpu_tensorops_compiled(void) {
+    return DS4_METAL_SDK_TENSOROPS ? 1 : 0;
+}
+
+int ds4_gpu_tensorops_runtime(void) {
+    return g_metal4_tensor_api_enabled ? 1 : 0;
+}
+
+int ds4_gpu_tensorops_m5_neural_accelerator(void) {
+    return g_metal4_m5_neural_accelerators_hint ? 1 : 0;
+}
+
+int ds4_gpu_tensorops_coop_input(void) {
+    return g_tensorops_coop_input_available ? 1 : 0;
+}
+
+int ds4_gpu_tensorops_native_int4_int8(void) {
+    return g_tensorops_native_int4_int8_available ? 1 : 0;
+}
+
+int ds4_gpu_tensorops_native_lowbit_float(void) {
+    return g_tensorops_native_lowbit_float_available ? 1 : 0;
+}
+
+int ds4_gpu_tensorops_native_e8m0_scale(void) {
+    return g_tensorops_native_e8m0_scale_available ? 1 : 0;
+}
+
+/* =========================================================================
+ * Dispatch/fallback counters and diagnostics (Task 2.3).
+ * =========================================================================
+ */
+static int ds4_gpu_tensorops_diag_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = ds4_gpu_env_bool("DS4_METAL_TENSOROPS_DIAG") > 0 ? 1 : 0;
+    }
+    return cached;
+}
+
+void ds4_gpu_tensorops_print_caps(void) {
+    if (!ds4_gpu_tensorops_diag_enabled()) return;
+    fprintf(stderr,
+        "Metal TensorOps:\n"
+        "  compiled                  %s\n"
+        "  runtime                   %s\n"
+        "  M5 neural accelerator     %s\n"
+        "  cooperative input         %s\n"
+        "  native int4/int8          %s\n"
+        "  native low-bit float      %s\n"
+        "  E8M0 scale plane          %s\n",
+        DS4_METAL_SDK_TENSOROPS ? "yes" : "no",
+        g_metal4_tensor_api_enabled ? "yes" : "no",
+        g_metal4_m5_neural_accelerators_hint ? "yes" : "no",
+        g_tensorops_coop_input_available ? "yes" : "no",
+        g_tensorops_native_int4_int8_available ? "yes" : "no",
+        g_tensorops_native_lowbit_float_available ? "yes" : "no",
+        g_tensorops_native_e8m0_scale_available ? "yes" : "no");
+}
+
+void ds4_gpu_tensorops_print_counters(void) {
+    if (!ds4_gpu_tensorops_diag_enabled()) return;
+    fprintf(stderr,
+        "Metal TensorOps counters:\n"
+        "  dense_tensorops_dispatches           %llu\n"
+        "  indexer_tensorops_dispatches         %llu\n"
+        "  moe_gate_up_tensorops_dispatches     %llu\n"
+        "  moe_down_tensorops_dispatches        %llu\n"
+        "  verify_tensorops_dispatches          %llu\n"
+        "  fallback_shape                       %llu\n"
+        "  fallback_quant                       %llu\n"
+        "  fallback_alignment                   %llu\n"
+        "  fallback_os                          %llu\n"
+        "  fallback_pipeline                    %llu\n"
+        "  fallback_streaming                   %llu\n",
+        (unsigned long long)atomic_load_explicit(&g_ctr_dense_tensorops, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&g_ctr_indexer_tensorops, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&g_ctr_moe_gate_up_tensorops, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&g_ctr_moe_down_tensorops, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&g_ctr_verify_tensorops, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&g_ctr_fallback_shape, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&g_ctr_fallback_quant, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&g_ctr_fallback_alignment, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&g_ctr_fallback_os, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&g_ctr_fallback_pipeline, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&g_ctr_fallback_streaming, memory_order_relaxed));
+}
+
+void ds4_gpu_tensorops_reset_counters(void) {
+    atomic_store_explicit(&g_ctr_dense_tensorops, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_ctr_indexer_tensorops, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_ctr_moe_gate_up_tensorops, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_ctr_moe_down_tensorops, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_ctr_verify_tensorops, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_ctr_fallback_shape, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_ctr_fallback_quant, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_ctr_fallback_alignment, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_ctr_fallback_os, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_ctr_fallback_pipeline, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_ctr_fallback_streaming, 0, memory_order_relaxed);
+}
+
+uint64_t ds4_gpu_tensorops_counter_dense(void) {
+    return atomic_load_explicit(&g_ctr_dense_tensorops, memory_order_relaxed);
+}
+uint64_t ds4_gpu_tensorops_counter_indexer(void) {
+    return atomic_load_explicit(&g_ctr_indexer_tensorops, memory_order_relaxed);
+}
+uint64_t ds4_gpu_tensorops_counter_moe_gate_up(void) {
+    return atomic_load_explicit(&g_ctr_moe_gate_up_tensorops, memory_order_relaxed);
+}
+uint64_t ds4_gpu_tensorops_counter_moe_down(void) {
+    return atomic_load_explicit(&g_ctr_moe_down_tensorops, memory_order_relaxed);
+}
+uint64_t ds4_gpu_tensorops_counter_verify(void) {
+    return atomic_load_explicit(&g_ctr_verify_tensorops, memory_order_relaxed);
+}
+uint64_t ds4_gpu_tensorops_counter_fallback_shape(void) {
+    return atomic_load_explicit(&g_ctr_fallback_shape, memory_order_relaxed);
+}
+uint64_t ds4_gpu_tensorops_counter_fallback_quant(void) {
+    return atomic_load_explicit(&g_ctr_fallback_quant, memory_order_relaxed);
+}
+uint64_t ds4_gpu_tensorops_counter_fallback_alignment(void) {
+    return atomic_load_explicit(&g_ctr_fallback_alignment, memory_order_relaxed);
+}
+uint64_t ds4_gpu_tensorops_counter_fallback_os(void) {
+    return atomic_load_explicit(&g_ctr_fallback_os, memory_order_relaxed);
+}
+uint64_t ds4_gpu_tensorops_counter_fallback_pipeline(void) {
+    return atomic_load_explicit(&g_ctr_fallback_pipeline, memory_order_relaxed);
+}
+uint64_t ds4_gpu_tensorops_counter_fallback_streaming(void) {
+    return atomic_load_explicit(&g_ctr_fallback_streaming, memory_order_relaxed);
 }
 
 static int ds4_gpu_warm_model_views(void) {
@@ -6357,6 +6606,9 @@ int ds4_gpu_init(void) {
         }
         ds4_gpu_print_device_summary();
         ds4_gpu_detect_metal4_features();
+        ds4_gpu_detect_tensorops_tiers();
+        ds4_gpu_apply_tensorops_rollback();
+        ds4_gpu_tensorops_print_caps();
 
         g_queue = [g_device newCommandQueue];
         if (!g_queue) {
@@ -10141,6 +10393,8 @@ int ds4_gpu_synchronize(void) {
 
 void ds4_gpu_cleanup(void) {
     if (!g_initialized) return;
+
+    ds4_gpu_tensorops_print_counters();
 
     @autoreleasepool {
         ds4_gpu_decode_pipeline_fast_cache_reset();
@@ -17550,11 +17804,29 @@ static int ds4_gpu_indexer_scores_batch_tensor(
             return 0;
         }
         /*
-         * The NAX/TensorOps score builder is a prefill-only win.  At small
-         * batches and in one-token decode the setup cost is not amortized, so
-         * those paths keep the older direct/tiled score kernels.
+         * Indexer TensorOps production policy (Task 4.4):
+         *
+         * M5 default: TensorOps when mpp_available && n_tokens >= 16 && head_dim == 128.
+         * Pre-M5:     legacy tiled kernel (no change).
+         * Quality:    kernel_dsv4_indexer_scores_tiled_f32 (full-precision legacy).
+         * Rollback:   DS4_METAL_DISABLE_TENSOROPS → legacy path.
+         *
+         * The 16-token × 32-row tile is the winning NAX shape from local sweeps;
+         * no tile change needed (Task 4.2 confirmed current shape).
          */
-        const bool use_nax = ds4_gpu_mpp_available() && n_tokens >= 16u;
+        const bool mpp_ok = ds4_gpu_mpp_available();
+        const bool use_nax = mpp_ok && n_tokens >= 16u;
+
+        /* Dispatch counters (Task 4.4). */
+        if (use_nax) {
+            atomic_fetch_add_explicit(&g_ctr_indexer_tensorops, 1, memory_order_relaxed);
+        } else if (!mpp_ok) {
+            atomic_fetch_add_explicit(&g_ctr_fallback_os, 1, memory_order_relaxed);
+        } else {
+            /* mpp available but n_tokens < 16 — shape too small for TensorOps. */
+            atomic_fetch_add_explicit(&g_ctr_fallback_shape, 1, memory_order_relaxed);
+        }
+
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             use_nax ? "kernel_dsv4_indexer_scores_nax" :
             (g_quality_mode ? "kernel_dsv4_indexer_scores_tiled_f32"
@@ -17879,6 +18151,144 @@ int ds4_gpu_dsv4_topk_mask_tensor(
     return 1;
 }
 
+/* =========================================================================
+ * Dense TensorOps Selection Policy (Task 3.4).
+ *
+ * This is the single point of truth for "should this dense matmul use
+ * TensorOps?"  Every per-quant dispatch function calls this helper rather
+ * than duplicating the capability/shape/alignment checks.
+ *
+ * The policy covers:
+ *   - capability gate (ds4_gpu_mpp_available)
+ *   - alignment requirements per quant type
+ *   - minimum batch size
+ *   - token tile selection (NR1 = 32, 64, or 128)
+ *   - split-prefix logic (Q8_0 only: TensorOps-prefix + legacy-tail)
+ *   - pipeline availability (not checked here; callers verify after)
+ *
+ * Pre-M5 devices never enter TensorOps because ds4_gpu_mpp_available()
+ * returns 0 when g_metal4_tensor_api_enabled is false, which is the case
+ * on pre-M5 hardware that lacks TensorOps runtime support.  No additional
+ * explicit exclusion is needed.
+ * =========================================================================
+ */
+
+/* Dense TensorOps selection result. */
+typedef struct {
+    int use_tensorops;          /* 1 = dispatch to TensorOps kernel, 0 = legacy */
+    int tile_n;                 /* NR1: 32, 64, or 128 */
+    int split_prefix;           /* Q8_0 only: 1 = TensorOps-prefix + legacy-tail */
+    uint64_t tensorops_rows;    /* Rows dispatched to TensorOps (may be < n_tok for split) */
+    const char *reject_reason;  /* Why legacy was chosen, or NULL if TensorOps selected */
+} ds4_dense_tensorops_policy;
+
+/*
+ * Quant type sentinel for F16/F32 weight matrices (not in DS4_METAL_TENSOR_*
+ * enum which only covers quantized types).
+ */
+enum {
+    DS4_DENSE_POLICY_QUANT_F16 = 0xF16u,
+    DS4_DENSE_POLICY_QUANT_F32 = 0xF32u,
+};
+
+static ds4_dense_tensorops_policy ds4_dense_select_tensorops(
+        uint32_t quant_type,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        int      prefer_decode_mpp) {
+    (void)prefer_decode_mpp; /* Reserved for future decode-MPP crossover policy. */
+    ds4_dense_tensorops_policy p = {0};
+
+    /* Capability gate.  On pre-M5 hardware or when rollback is active,
+     * ds4_gpu_mpp_available() returns 0 and we stay on the legacy path. */
+    if (!ds4_gpu_mpp_available()) {
+        p.reject_reason = "tensorops_unavailable";
+        atomic_fetch_add_explicit(&g_ctr_fallback_os, 1, memory_order_relaxed);
+        return p;
+    }
+
+    /* Minimum batch size — TensorOps tiles require at least 32 tokens. */
+    if (n_tok < 32u) {
+        p.reject_reason = "shape";
+        atomic_fetch_add_explicit(&g_ctr_fallback_shape, 1, memory_order_relaxed);
+        return p;
+    }
+
+    /* Per-quant alignment requirements.
+     *
+     * F16:    in_dim % 32 == 0, out_dim % 64 == 0
+     * Q8_0:   in_dim % 64 == 0, out_dim % 64 == 0
+     * Q4_0/K: in_dim % 64 == 0, out_dim % 64 == 0
+     */
+    uint32_t in_align = 64u;
+    if (quant_type == DS4_DENSE_POLICY_QUANT_F16) {
+        in_align = 32u;
+    }
+    if ((in_dim % in_align) != 0 || (out_dim % 64u) != 0) {
+        p.reject_reason = "alignment";
+        atomic_fetch_add_explicit(&g_ctr_fallback_alignment, 1, memory_order_relaxed);
+        return p;
+    }
+
+    /* Determine how many rows TensorOps will process.
+     *
+     * Q8_0 supports split-prefix: when n_tok is not a multiple of 32 and the
+     * batch is large enough, the aligned prefix goes through TensorOps while
+     * the remainder uses the boundary-safe legacy kernel.  This avoids
+     * sending the entire batch to legacy just because of a short tail.
+     *
+     * Other quant types require n_tok % 32 == 0 for TensorOps (no split). */
+    uint64_t nax_rows = 0;
+    int split_prefix = 0;
+
+    if (quant_type == DS4_METAL_TENSOR_Q8_0) {
+        if ((n_tok % 32u) == 0u) {
+            nax_rows = n_tok;
+        } else if (!g_quality_mode && n_tok >= 192u) {
+            /* Split: aligned prefix through TensorOps, tail through legacy. */
+            nax_rows = n_tok - (n_tok % 32u);
+            split_prefix = 1;
+        } else {
+            /* Too small to split or --quality mode retains single schedule. */
+            p.reject_reason = "shape";
+            atomic_fetch_add_explicit(&g_ctr_fallback_shape, 1, memory_order_relaxed);
+            return p;
+        }
+    } else {
+        /* Q4_0, Q4_K, F16, F32: require exact 32-alignment. */
+        if ((n_tok % 32u) != 0u) {
+            p.reject_reason = "shape";
+            atomic_fetch_add_explicit(&g_ctr_fallback_shape, 1, memory_order_relaxed);
+            return p;
+        }
+        nax_rows = n_tok;
+    }
+
+    /* Token tile selection — auto-select the fastest proven M5 variant.
+     * Larger tiles have better amortization but require alignment.  Prefer
+     * the largest tile whose alignment is satisfied. */
+    int tile_n = 32;
+    if ((nax_rows % 128u) == 0) {
+        tile_n = 128;
+    } else if ((nax_rows % 64u) == 0) {
+        tile_n = 64;
+    }
+
+    /* All checks passed — TensorOps is eligible. */
+    p.use_tensorops = 1;
+    p.tile_n = tile_n;
+    p.split_prefix = split_prefix;
+    p.tensorops_rows = nax_rows;
+    p.reject_reason = NULL;
+
+    /* Counter is incremented here; the caller increments fallback counters
+     * only if pipeline lookup subsequently fails. */
+    atomic_fetch_add_explicit(&g_ctr_dense_tensorops, 1, memory_order_relaxed);
+
+    return p;
+}
+
 static int ds4_gpu_matmul_q8_0_legacy_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -18029,31 +18439,23 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
          * memory, then uses direct-RHS MPP for the activation tile.  This avoids
          * staging RHS into threadgroup memory and was the direct replacement for
          * the slower generic MPP prototype.
+         *
+         * Selection policy is centralized in ds4_dense_select_tensorops()
+         * (Task 3.4) — it is the single point of truth for whether this dense
+         * matmul should use TensorOps.
          */
-        /*
-         * An unaligned token count used to send the entire projection through
-         * the generic kernel.  Run its aligned prefix through TensorOps and
-         * leave only the final partial tile to the boundary-safe kernel.
-         * Tiny prompts do not amortize the second dispatch, while --quality
-         * deliberately retains the single-kernel arithmetic schedule.
-         */
-        const bool split_nax_prefix =
-            !g_quality_mode && n_tok >= 192u && (n_tok % 32u) != 0u;
-        const uint64_t nax_rows =
-            (n_tok % 32u) == 0u ? n_tok :
-            (split_nax_prefix ? n_tok - (n_tok % 32u) : 0u);
+        ds4_dense_tensorops_policy nax_policy = ds4_dense_select_tensorops(
+            DS4_METAL_TENSOR_Q8_0,
+            (uint32_t)in_dim,
+            (uint32_t)out_dim,
+            (uint32_t)n_tok,
+            prefer_decode_mpp ? 1 : 0);
+
         uint64_t generic_row0 = 0u;
         uint64_t generic_rows = n_tok;
-        if (ds4_gpu_mpp_available() &&
-            nax_rows >= 32u &&
-            (in_dim % 64u) == 0 &&
-            (out_dim % 64u) == 0) {
-            uint64_t nax_tile_n = 32u;
-            if ((nax_rows % 128u) == 0) {
-                nax_tile_n = 128u;
-            } else if ((nax_rows % 64u) == 0) {
-                nax_tile_n = 64u;
-            }
+        if (nax_policy.use_tensorops) {
+            const uint64_t nax_rows = nax_policy.tensorops_rows;
+            const uint64_t nax_tile_n = (uint64_t)nax_policy.tile_n;
             const char *nax_fn = nax_tile_n == 128u
                 ? "kernel_mul_mm_q8_0_f32_nax_direct_rhs_n128"
                 : (nax_tile_n == 64u
@@ -18087,7 +18489,10 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                 generic_row0 = nax_rows;
                 generic_rows = n_tok - nax_rows;
             }
-            if (!pipeline) ds4_gpu_warn_mpp_fallback();
+            if (!pipeline) {
+                ds4_gpu_warn_mpp_fallback();
+                atomic_fetch_add_explicit(&g_ctr_fallback_pipeline, 1, memory_order_relaxed);
+            }
         }
 
         const bool bc_inp = (in_dim % 32u) != 0;
@@ -18508,17 +18913,16 @@ static int ds4_gpu_matmul_quant_impl_tensor(
             }
         }
 
-        if (ds4_gpu_mpp_available() &&
-            n_tok >= 32u &&
-            (in_dim % 64u) == 0 &&
-            (out_dim % 64u) == 0 &&
-            (n_tok % 32u) == 0) {
-            uint64_t nax_tile_n = 32u;
-            if ((n_tok % 128u) == 0) {
-                nax_tile_n = 128u;
-            } else if ((n_tok % 64u) == 0) {
-                nax_tile_n = 64u;
-            }
+        /* Dense TensorOps selection — centralized policy (Task 3.4). */
+        ds4_dense_tensorops_policy nax_policy = ds4_dense_select_tensorops(
+            weight_type,
+            (uint32_t)in_dim,
+            (uint32_t)out_dim,
+            (uint32_t)n_tok,
+            prefer_decode_mpp ? 1 : 0);
+
+        if (nax_policy.use_tensorops) {
+            const uint64_t nax_tile_n = (uint64_t)nax_policy.tile_n;
             const char *nax_fn = ds4_gpu_q4_nax_name(weight_type, nax_tile_n);
             id<MTLComputePipelineState> pipeline =
                 nax_fn ? ds4_gpu_get_mul_mm_pipeline(nax_fn, false, false) : nil;
@@ -18542,6 +18946,7 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 return 1;
             }
             ds4_gpu_warn_mpp_fallback();
+            atomic_fetch_add_explicit(&g_ctr_fallback_pipeline, 1, memory_order_relaxed);
         }
 
         const char *mm_fn = ds4_gpu_q4_mm_name(weight_type);
@@ -19596,20 +20001,18 @@ int ds4_gpu_matmul_f16_tensor(
 
         /*
          * Same direct-RHS TensorOps structure as Q8_0, but for F16 model
-         * matrices.  The 128-token RHS tile is kept when the batch alignment
-         * allows it because the later tile_n=64 retest was neutral/slower.
+         * matrices.  Selection policy centralized in ds4_dense_select_tensorops
+         * (Task 3.4).
          */
-        if (ds4_gpu_mpp_available() &&
-            n_tok >= 32u &&
-            (in_dim % 32u) == 0 &&
-            (out_dim % 64u) == 0 &&
-            (n_tok % 32u) == 0) {
-            uint64_t nax_tile_n = 32u;
-            if ((n_tok % 128u) == 0) {
-                nax_tile_n = 128u;
-            } else if ((n_tok % 64u) == 0) {
-                nax_tile_n = 64u;
-            }
+        ds4_dense_tensorops_policy nax_policy = ds4_dense_select_tensorops(
+            DS4_DENSE_POLICY_QUANT_F16,
+            (uint32_t)in_dim,
+            (uint32_t)out_dim,
+            (uint32_t)n_tok,
+            0);
+
+        if (nax_policy.use_tensorops) {
+            const uint64_t nax_tile_n = (uint64_t)nax_policy.tile_n;
             const char *nax_fn = nax_tile_n == 128u
                 ? "kernel_mul_mm_f16_f32_mpp_direct_rhs_n128"
                 : (nax_tile_n == 64u
@@ -19639,6 +20042,7 @@ int ds4_gpu_matmul_f16_tensor(
                 return 1;
             }
             ds4_gpu_warn_mpp_fallback();
+            atomic_fetch_add_explicit(&g_ctr_fallback_pipeline, 1, memory_order_relaxed);
         }
 
         const bool bc_inp = (in_dim % 32u) != 0;
@@ -29654,6 +30058,86 @@ static int ds4_gpu_routed_mm_mpp_mask(void) {
     return ds4_gpu_mpp_available() ? 7 : 0;
 }
 
+/* -------------------------------------------------------------------------
+ * Staged-dequant TensorOps Q8_0 control kernel (task 6.2 prototype).
+ *
+ * Pipeline name: "kernel_mul_mm_id_q8_0_staged_dequant_control"
+ * Dispatch args: ds4_metal_args_mul_mm_id (same as kernel_mul_mm_id_mpp)
+ * Buffers:       src0 (Q8_0 weights), src1 (float activations),
+ *                htpe, hids, dst, work
+ * Threadgroup:   max(NR0*NK*2 + NR1*NK*2, NR0*NR1*4) = max(6144, 8192) = 8192
+ * Threads/TG:    128 (4 simdgroups)
+ * Grid:          (work_item_count, ceil(ne0/64), 1)
+ *
+ * This kernel is a benchmark/correctness control for task 6.3 (cooperative-
+ * input dequant candidate). It is NOT production-dispatched. To use it:
+ *
+ *   id<MTLComputePipelineState> control_pipeline =
+ *       ds4_gpu_get_mul_mm_id_pipeline(
+ *           "kernel_mul_mm_id_q8_0_staged_dequant_control", false);
+ *
+ * Then dispatch with the same encode pattern as kernel_mul_mm_id_mpp:
+ * same buffers, same work-item structure, same args, threadgroup size 8192,
+ * threads per threadgroup 128.
+ *
+ * The threadgroup memory requirement is 8192 bytes (NR0*NR1*sizeof(float)
+ * for the output scatter stage, which dominates the staging tiles).
+ * ------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------
+ * Cooperative-input dequant TensorOps Q8_0 CANDIDATE kernel (task 6.3).
+ *
+ * Pipeline name: "kernel_mul_mm_id_q8_0_coop_input_candidate"
+ * Dispatch args: ds4_metal_args_mul_mm_id (same as control)
+ * Buffers:       src0 (Q8_0 weights), src1 (float activations),
+ *                htpe, hids, dst, work
+ * Threadgroup:   max(NR1*NK*2, NR0*NR1*4) = max(2048, 8192) = 8192
+ *                (saves 4096 bytes vs control — no weight tile needed)
+ * Threads/TG:    128 (4 simdgroups)
+ * Grid:          (work_item_count, ceil(ne0/64), 1)
+ * Requires:      DS4_METAL_SDK_COOP_INPUT (macOS 26.3+ SDK)
+ *
+ * This kernel tests whether cooperative tensor inputs (macOS 26.3+) can
+ * eliminate the threadgroup weight staging round-trip. Weights are dequanted
+ * from Q8_0 directly into a cooperative tensor used as the matmul2d RIGHT
+ * operand, bypassing threadgroup memory entirely for that operand.
+ *
+ * Activations still go through threadgroup because they are scattered
+ * (each token in an expert bucket came from a different batch position).
+ *
+ * To use for A/B benchmarking against the task 6.2 control:
+ *
+ *   #if DS4_METAL_SDK_COOP_INPUT
+ *   // Host-side guard — only dispatch if cooperative input is available
+ *   if (ds4_gpu_tensorops_coop_input()) {
+ *       id<MTLComputePipelineState> candidate_pipeline =
+ *           ds4_gpu_get_mul_mm_id_pipeline(
+ *               "kernel_mul_mm_id_q8_0_coop_input_candidate", false);
+ *   }
+ *   #endif
+ *
+ * Dispatch is IDENTICAL to the control: same buffers, same work-item
+ * structure, same args, same threadgroup memory (8192 bytes — dominated
+ * by the output scatter stage), same threads per threadgroup (128).
+ *
+ * Expected advantages:
+ *   - Eliminates weight threadgroup write (4096 bytes/iteration saved)
+ *   - Eliminates one threadgroup_barrier per K iteration (the pre-matmul
+ *     barrier for weight staging is gone)
+ *   - Weight data flows directly from device memory → registers → matmul
+ *     hardware without the threadgroup detour
+ *
+ * Expected risks:
+ *   - Random-access Q8_0 dequant per cooperative element may have worse
+ *     locality than the bulk paired-load dequant in the control
+ *   - Register pressure from holding the cooperative tensor may reduce
+ *     occupancy
+ *   - The opaque per-thread element mapping may scatter accesses across
+ *     non-adjacent weight rows, degrading cache line utilization
+ *
+ * Task 6.4 will microbenchmark this against the control to determine
+ * which mechanism wins for real MoE dimensions.
+ * ------------------------------------------------------------------------- */
 static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
     switch (type) {
     case DS4_METAL_TENSOR_Q8_0:
@@ -40648,7 +41132,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool use_mm_id =
             !use_q4_batch_expert_table &&
             !use_iq2_batch_selected_addr &&
-            n_tokens >= 32u &&
+            n_tokens >= ds4_gpu_moe_mm_id_threshold() &&
             ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
         /*
          * MTP verification is neither normal decode nor large prefill: the
@@ -40860,7 +41344,40 @@ int ds4_gpu_routed_moe_batch_tensor(
                     down_type == DS4_METAL_TENSOR_Q2_K ?
                         "kernel_mul_mm_id_q2_K_f16_mpp" :
                         "kernel_mul_mm_id_iq2_xxs_f16_mpp", false);
-                if (mpp) down_mm_pipeline = mpp;
+                if (mpp) {
+                    down_mm_pipeline = mpp;
+                    atomic_fetch_add_explicit(&g_ctr_moe_down_tensorops, 1, memory_order_relaxed);
+                }
+            }
+            /* Task 8.2: MXFP4 down TensorOps via staged-dequant → matmul2d.
+             * Same kernel_mul_mm_id_mpp template as Q2_K/IQ2_XXS above but
+             * instantiated with block_mxfp4/dequantize_mxfp4. Preserves
+             * per-expert per-token write semantics; the subsequent sum kernel
+             * is unchanged. Requires request_mid_f16 (half RHS activations)
+             * which is already the production default for the down path. */
+            if ((mpp_mask & 4) && request_mid_f16 &&
+                down_type == DS4_METAL_TENSOR_MXFP4 &&
+                getenv("DS4_METAL_DISABLE_MXFP4_MOE_DOWN_MPP") == NULL) {
+                id<MTLComputePipelineState> mpp = ds4_gpu_get_mul_mm_id_pipeline(
+                    "kernel_mul_mm_id_mxfp4_f16_mpp", false);
+                if (mpp) {
+                    down_mm_pipeline = mpp;
+                    atomic_fetch_add_explicit(&g_ctr_moe_down_tensorops, 1, memory_order_relaxed);
+                }
+            }
+            /* Task 8.2: Q4_K down TensorOps via staged-dequant → matmul2d.
+             * Same pattern as MXFP4 above. Falls back to the legacy simdgroup
+             * kernel if the pipeline cannot be created or is explicitly
+             * disabled via DS4_METAL_DISABLE_Q4_K_MOE_DOWN_MPP. */
+            if ((mpp_mask & 4) && request_mid_f16 &&
+                down_type == DS4_METAL_TENSOR_Q4_K &&
+                getenv("DS4_METAL_DISABLE_Q4_K_MOE_DOWN_MPP") == NULL) {
+                id<MTLComputePipelineState> mpp = ds4_gpu_get_mul_mm_id_pipeline(
+                    "kernel_mul_mm_id_q4_K_f16_mpp", false);
+                if (mpp) {
+                    down_mm_pipeline = mpp;
+                    atomic_fetch_add_explicit(&g_ctr_moe_down_tensorops, 1, memory_order_relaxed);
+                }
             }
             if (use_mm_id_pair_swiglu) {
                 /* Exact half-domain block scaling for the resident MXFP4 pair
@@ -40877,23 +41394,73 @@ int ds4_gpu_routed_moe_batch_tensor(
                     !g_quality_mode &&
                     !g_ssd_streaming_mode &&
                     g_tp_split_world == 1;
-                pair_swiglu_mm_pipeline =
-                    ds4_gpu_get_pipeline(
-                        gate_type == DS4_METAL_TENSOR_Q4_K ?
-                            "kernel_mul_mm_id_q4_K_pair_swiglu_f16" :
-                        gate_type == DS4_METAL_TENSOR_MXFP4 ?
-                            (use_mxfp4_mm_id_pair_swiglu_compact_tile ?
-                                (use_mxfp4_mm_id_pair_half_scale ?
-                                    "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_compact_tail_cull_half_scale" :
-                                    "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_compact_tail_cull") :
-                             use_mxfp4_mm_id_pair_tail_simdgroup_cull ?
-                                (use_mxfp4_mm_id_pair_half_scale ?
-                                    "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_tail_cull_half_scale" :
-                                    "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_tail_cull") :
-                                (use_mxfp4_mm_id_pair_half_scale ?
-                                    "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_half_scale" :
-                                    "kernel_mul_mm_id_mxfp4_pair_swiglu_f16")) :
-                            "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
+                /* Task 7.3: When TensorOps is available and Q4_K gate/up is
+                 * in use, prefer the TensorOps pair+SwiGLU kernel which
+                 * exercises the M5 Neural Accelerator via matmul2d. Falls back
+                 * to the simdgroup kernel if the pipeline cannot be created
+                 * (old SDK, unsupported device, etc). */
+                const bool use_q4_k_mpp_pair_swiglu =
+                    gate_type == DS4_METAL_TENSOR_Q4_K &&
+                    (mpp_mask & 3) &&
+                    getenv("DS4_METAL_DISABLE_Q4_K_PAIR_SWIGLU_MPP") == NULL;
+                if (use_q4_k_mpp_pair_swiglu) {
+                    id<MTLComputePipelineState> mpp_pair =
+                        ds4_gpu_get_pipeline(
+                            "kernel_mul_mm_id_q4_K_pair_swiglu_mpp");
+                    if (mpp_pair) {
+                        pair_swiglu_mm_pipeline = mpp_pair;
+                        atomic_fetch_add_explicit(&g_ctr_moe_gate_up_tensorops, 1, memory_order_relaxed);
+                    } else {
+                        /* TensorOps pipeline unavailable — fall through to
+                         * legacy simdgroup pair+SwiGLU below. */
+                        pair_swiglu_mm_pipeline =
+                            ds4_gpu_get_pipeline(
+                                "kernel_mul_mm_id_q4_K_pair_swiglu_f16");
+                    }
+                } else {
+                    pair_swiglu_mm_pipeline =
+                        ds4_gpu_get_pipeline(
+                            gate_type == DS4_METAL_TENSOR_Q4_K ?
+                                "kernel_mul_mm_id_q4_K_pair_swiglu_f16" :
+                            gate_type == DS4_METAL_TENSOR_MXFP4 ?
+                                (use_mxfp4_mm_id_pair_swiglu_compact_tile ?
+                                    (use_mxfp4_mm_id_pair_half_scale ?
+                                        "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_compact_tail_cull_half_scale" :
+                                        "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_compact_tail_cull") :
+                                 use_mxfp4_mm_id_pair_tail_simdgroup_cull ?
+                                    (use_mxfp4_mm_id_pair_half_scale ?
+                                        "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_tail_cull_half_scale" :
+                                        "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_tail_cull") :
+                                    (use_mxfp4_mm_id_pair_half_scale ?
+                                        "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_half_scale" :
+                                        "kernel_mul_mm_id_mxfp4_pair_swiglu_f16")) :
+                                "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
+                }
+            }
+            /*
+             * Task 7.2: TensorOps override for MXFP4 fused gate+up pair+SwiGLU.
+             * When M5 TensorOps is available and MXFP4 is the gate quant,
+             * replace the legacy simdgroup pair_swiglu kernel with the
+             * matmul2d-based variant that exercises the M5 Neural Accelerator.
+             * The buffer interface is identical so the same encode function
+             * works; only the pipeline and threadgroup memory size differ.
+             * Falls back to the legacy kernel if the pipeline is unavailable
+             * (e.g., compiled without DS4_METAL_HAS_TENSOR) or explicitly
+             * disabled via DS4_METAL_DISABLE_MXFP4_MOE_GATE_UP_MPP.
+             */
+            if (use_mm_id_pair_swiglu &&
+                pair_swiglu_mm_pipeline &&
+                gate_type == DS4_METAL_TENSOR_MXFP4 &&
+                (mpp_mask & 3) &&
+                !use_mxfp4_mm_id_pair_swiglu_compact_tile &&
+                getenv("DS4_METAL_DISABLE_MXFP4_MOE_GATE_UP_MPP") == NULL) {
+                id<MTLComputePipelineState> mpp_pair =
+                    ds4_gpu_get_mul_mm_id_pipeline(
+                        "kernel_mul_mm_id_mxfp4_mpp_pair_swiglu_f16", false);
+                if (mpp_pair) {
+                    pair_swiglu_mm_pipeline = mpp_pair;
+                    atomic_fetch_add_explicit(&g_ctr_moe_gate_up_tensorops, 1, memory_order_relaxed);
+                }
             }
             if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline ||
                 (use_mm_id_pair_swiglu && !pair_swiglu_mm_pipeline)) {
