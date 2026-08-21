@@ -119,6 +119,7 @@ __pycache__/
 /gguf-tools/libds4quants.dylib
 /gguf-tools/libds4quants.so
 /misc/
+!/misc/pack_experts.py
 .*.swp
 .DS_Store
 
