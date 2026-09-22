@@ -305,6 +305,11 @@ int ds4_gpu_dsv41_norm_pair_rows(ds4_gpu_tensor *out0, const ds4_gpu_tensor *x0,
                                  ds4_gpu_tensor *out1, const ds4_gpu_tensor *x1, uint64_t weight1_offset, uint32_t n1,
                                  const void *model_map, uint64_t model_size, float eps, uint32_t rows);
 /* Gather 512-wide F32 KV rows; IDs must come from top-k over source_rows. */
+/* Same gather from fp16 source rows (V4.1 compressed KV stored as fp16:
+ * every FP4-with-E4M3-scale value is exact in half precision). */
+int ds4_gpu_dsv41_gather_kv_f16(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
+                               const ds4_gpu_tensor *ids, uint32_t source_rows,
+                               uint32_t selected_rows);
 int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
                            const ds4_gpu_tensor *ids, uint32_t source_rows,
                            uint32_t selected_rows);
