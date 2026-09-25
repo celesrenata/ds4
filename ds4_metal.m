@@ -16652,7 +16652,10 @@ static void ds4_gpu_stream_expert_cache_prune_global(
                  expert++) {
                 ds4_gpu_stream_expert_cache_entry *e =
                     &g_stream_expert_cache[layer][expert];
+                /* clear_entry skips in-flight entries, so picking one would
+                 * leave entry_count unchanged and spin this loop forever. */
                 if (!e->valid ||
+                    ds4_gpu_stream_expert_cache_entry_inflight(e) ||
                     ds4_gpu_stream_expert_cache_entry_protected(layer,
                                                                 expert,
                                                                 protect_layer,
