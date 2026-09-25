@@ -15975,6 +15975,7 @@ retry:
     for (uint32_t layer = 0;
          layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
          layer++) {
+        if (g_stream_expert_cache_layer_count[layer] == 0) continue;
         for (uint32_t expert = 0;
              expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
              expert++) {
@@ -16209,6 +16210,7 @@ retry:
     for (uint32_t layer = 0;
          layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
          layer++) {
+        if (g_stream_expert_cache_layer_count[layer] == 0) continue;
         for (uint32_t expert = 0;
              expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
              expert++) {
@@ -16357,6 +16359,7 @@ static uint32_t ds4_gpu_stream_expert_cache_release_mlock_margin(
         for (uint32_t layer = 0;
              layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
              layer++) {
+            if (g_stream_expert_cache_layer_count[layer] == 0) continue;
             for (uint32_t expert = 0;
                  expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
                  expert++) {
@@ -16643,6 +16646,7 @@ static void ds4_gpu_stream_expert_cache_prune_global(
         for (uint32_t layer = 0;
              layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
              layer++) {
+            if (g_stream_expert_cache_layer_count[layer] == 0) continue;
             for (uint32_t expert = 0;
                  expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
                  expert++) {
@@ -18100,7 +18104,8 @@ static void ds4_gpu_stream_expert_cache_clear_layer(uint32_t layer) {
          expert++) {
         ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
     }
-    g_stream_expert_cache_layer_count[layer] = 0;
+    /* clear_entry decrements layer_count itself and skips in-flight
+     * entries, so forcing 0 here would desync it from the live entries. */
 }
 
 /* Optional work submitted after every selected entry is protected, but before
