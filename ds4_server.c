@@ -11547,8 +11547,8 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  * (generate_job) materializes:
  *
  *   responses-visible -> responses-tool-output -> anthropic-tool-output ->
- *   memory-rewind (GLM only) -> memory-token -> thinking-visible ->
- *   memory-text
+ *   memory-rewind (GLM truncation) -> memory-token -> thinking-visible ->
+ *   memory-text -> memory-rewind (GLM-5.3 snapshot, below a divergence)
  *
  * Both slot routing (job_slot_score, under dispatch) and the execution
  * ladder consume this probe, so routing decisions and execution-time reuse
@@ -11573,9 +11573,11 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  * - anthropic-tool-output: /v1/messages has no server-side response object,
  *   but tool_use_id is a precise continuation handle inside a live local
  *   agent loop.
- * - memory-rewind (GLM only): the prompt is a strict truncation of the
+ * - memory-rewind (GLM, truncation): the prompt is a strict truncation of the
  *   checkpoint; the live KV is rewound and the final prompt token
- *   reevaluated.
+ *   reevaluated.  GLM-5.3 leaves this tier to the snapshot one below: it
+ *   cannot truncate its recurrent state, so its rewind target is whatever the
+ *   core can restore.
  * - memory-token: the checkpoint is an exact token prefix of the prompt.
  * - thinking-visible: after a tool-less thinking answer the next prompt
  *   omits the hidden reasoning by design; the remembered visible transcript
@@ -11586,6 +11588,13 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  *   is authoritative, so the checkpoint tokens are kept verbatim and only
  *   the suffix text is tokenized (full-prompt BPE may have merged across
  *   the byte boundary).
+ * - memory-rewind below a diverged prompt (GLM-5.3, last): the prompt shares a
+ *   token prefix with the checkpoint and then differs (a client that compacted
+ *   or pruned its history).  GLM-5.3 carries a recurrent linear-attention state
+ *   that cannot be truncated, so it resumes from the newest snapshot the
+ *   prefill left behind and re-reads only the tail.  Tried after every tier
+ *   that needs no recompute, and only where the core reports a position it can
+ *   actually restore.
  *
  * Locking: slot_probe_reuse_locked() requires tool_mu held (dispatch holds
  * it while scoring); slot_probe_reuse() is the worker-path wrapper.
@@ -11593,6 +11602,28 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
 
 static int live_prefix_rewind_target(bool backend_can_rewind,
                                      int old_pos, int prompt_len, int common);
+
+/* GLM-5.3 rewinds to a snapshot, not to an arbitrary token: its KDA recurrence
+ * and the pooled indexer tail are recoverable only at positions the prefill
+ * loop snapshotted, so a shared prefix is a target only when a snapshot sits at
+ * or below it.  Ask the core which position is reachable instead of proposing
+ * one the rewind would refuse, which would log a rewind and then rebuild from
+ * zero anyway.  The target stays strictly below the prompt, so the final prompt
+ * token is always re-read for fresh logits.  A truncation whose ring holds
+ * nothing still names prompt_len - 1: the ordinary ds4_session_rewind() covers
+ * that one without a snapshot, and refusing it would only cost the rebuild that
+ * was already happening. */
+static int glm_live_rewind_target(ds4_session *session, int old_pos,
+                                  int prompt_len, int common) {
+    if (!session || common <= 0 || common >= old_pos || prompt_len <= 1) {
+        return -1;
+    }
+    const bool truncated = common == prompt_len;
+    const int reachable = ds4_session_rewind_floor(
+        session, truncated ? prompt_len - 1 : common);
+    if (reachable >= 0 || !truncated) return reachable;
+    return prompt_len - 1;
+}
 
 typedef enum {
     REUSE_NONE = 0,
@@ -11696,8 +11727,13 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
     const int common = ds4_session_common_prefix(slot->session, &req->prompt);
     const bool token_image_prefix = ds4_session_vision_prefix_matches(
         slot->session, req->images, req->image_count);
+    /* GLM-5.3 cannot truncate its KDA recurrence, so its only live rewind is
+     * the snapshot floor: the target is asked of the core further down, after
+     * every tier that needs no recompute.  The older GLM frontier rewind keeps
+     * the truncation tier above. */
     const int rewind_to = live_prefix_rewind_target(
-        ds4_engine_is_glm_dsa(s->engine), live_pos, req->prompt.len, common);
+        ds4_engine_is_glm_dsa(s->engine) && !ds4_engine_is_glm53(s->engine),
+        live_pos, req->prompt.len, common);
     if (rewind_to >= 0 && token_image_prefix) {
         pr.kind = REUSE_MEMORY_REWIND;
         pr.reuse_tokens = rewind_to;
@@ -11743,6 +11779,23 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         pr.reuse_tokens = live_pos;
         pr.suffix_off = slot->live_text_len;
         return pr;
+    }
+
+    /* GLM-5.3 last, after every tier that needs no recompute: this one replays
+     * a tail.  It is the tier that serves a client which rewrote its history
+     * (compaction, tool-result pruning) -- the request keeps a long prefix of
+     * the live tokens and diverges below the frontier, where only a snapshot
+     * can put GLM-5.3 back. */
+    if (ds4_engine_is_glm53(s->engine) &&
+        ds4_session_vision_prefix_matches(slot->session, NULL, 0) &&
+        token_image_prefix) {
+        const int glm_to = glm_live_rewind_target(slot->session, live_pos,
+                                                 req->prompt.len, common);
+        if (glm_to >= 0) {
+            pr.kind = REUSE_MEMORY_REWIND;
+            pr.reuse_tokens = glm_to;
+            return pr;
+        }
     }
 
     return pr;
@@ -13534,7 +13587,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         break;
     case REUSE_MEMORY_REWIND: {
         pthread_mutex_lock(&s->inference_mu);
-        ds4_session_rewind(slot->session, reuse.reuse_tokens);
+        /* GLM-5.3 rewinds to a live-rewind snapshot when one sits exactly on
+         * the target the probe named; every other engine uses the ordinary
+         * rewind.  Snapshot restores leave logits stale on purpose, which is
+         * safe here because the sync below re-reads at least the final prompt
+         * token -- the generation-path rewind must keep using
+         * ds4_session_rewind(). */
+        if (!ds4_session_rewind_snapshot(slot->session, reuse.reuse_tokens)) {
+            ds4_session_rewind(slot->session, reuse.reuse_tokens);
+        }
         /* Rewinding mutates the session, so re-validate before trusting the
          * frontier: the common prefix must land exactly on the rewind target
          * and the vision state must still describe the request (upstream's
@@ -16406,6 +16467,67 @@ static void test_slot_routing_staleness_tiers(void) {
     ds4_session_free_test_checkpoint(slots[3].session);
     ds4_tokens_free(&sub.req.prompt);
     ds4_tokens_free(&cont.req.prompt);
+}
+
+/* GLM-5.3 rewind tier: the KDA recurrence and the pooled indexer tail cannot
+ * be truncated, so the only live rewind is the snapshot floor the core
+ * reports.  A request whose history was rewritten below the frontier (a client
+ * that compacted or pruned its history) must reach that tier instead of
+ * rebuilding the whole prefix -- the regression this tier exists for. */
+static void test_slot_probe_glm_rewind_tiers(void) {
+    ds4_test_use_glm53_shape(1);
+    TEST_ASSERT(ds4_engine_is_glm_dsa(NULL));
+    server s = {0};
+    int ckpt_tok[10];
+    for (int i = 0; i < 10; i++) ckpt_tok[i] = i + 1;
+    struct {
+        int shared, extra, floor;
+        slot_reuse_kind kind;
+        int reuse;
+    } cases[] = {
+        {6, 6, 6, REUSE_MEMORY_REWIND, 6},  /* diverged after 6 */
+        {7, 6, 6, REUSE_MEMORY_REWIND, 6},  /* diverged after 7: snapshot below */
+        {8, 0, 6, REUSE_MEMORY_REWIND, 6},  /* truncation: last token re-read */
+        {6, 6, 0, REUSE_NONE, 0},           /* no snapshot reachable */
+        {8, 0, 0, REUSE_MEMORY_REWIND, 7},  /* truncation with an empty ring:
+                                             * the ordinary rewind's 2-token
+                                             * MTP window must stay reachable */
+        {10, 1, 6, REUSE_MEMORY_TOKEN, 10}, /* exact extension still wins */
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        ds4_session_set_test_rewind_floor(slot.session, cases[c].floor);
+        job j = {0};
+        for (int i = 0; i < cases[c].shared; i++)
+            ds4_tokens_push(&j.req.prompt, i + 1);
+        for (int i = 0; i < cases[c].extra; i++)
+            ds4_tokens_push(&j.req.prompt, 900 + i);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == cases[c].kind);
+        TEST_ASSERT(pr.reuse_tokens == cases[c].reuse);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+    /* A checkpoint holding images is never rewound: the replayed positions
+     * would treat image rows as text. */
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        ds4_session_set_test_rewind_floor(slot.session, 6);
+        ds4_vision_span image = {0};
+        image.token_start = 2;
+        image.embedding.token_count = 2;
+        ds4_session_set_test_images(slot.session, &image, 1);
+        job j = {0};
+        for (int i = 0; i < 6; i++) ds4_tokens_push(&j.req.prompt, i + 1);
+        for (int i = 0; i < 6; i++) ds4_tokens_push(&j.req.prompt, 900 + i);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+    ds4_test_use_glm53_shape(0);
 }
 
 static void test_slot_probe_live_state_tiers(void) {
@@ -22985,6 +23107,7 @@ static void ds4_server_unit_tests_run(void) {
     test_batched_live_continuation_slot_binding();
     test_live_continuation_contract();
     test_slot_probe_and_routing_scores();
+    test_slot_probe_glm_rewind_tiers();
     test_slot_probe_live_state_tiers();
     test_slot_probe_vision_tiers();
     test_slot_routing_staleness_tiers();
