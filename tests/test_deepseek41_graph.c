@@ -1970,8 +1970,7 @@ done:
     ds4_gpu_tensor_free(st);
     ds4_gpu_tensor_free(wt);
     free(raw);
-    if (!rc) puts("iq1s-routed: OK");
-    return rc;
+    if (!rc) puts("iq1s-routed: OK");    return rc;
 }
 
 static int check_vision_routing(void) {
@@ -2113,8 +2112,7 @@ int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[2], "--batch-head"))
         return check_batch_head(argv[1]);
     if (argc == 2 && !strcmp(argv[1], "--iq1s-routed"))
-        return check_iq1s_routed();
-    if (argc == 2 && !strcmp(argv[1], "--vision-routing"))
+        return check_iq1s_routed();    if (argc == 2 && !strcmp(argv[1], "--vision-routing"))
         return check_vision_routing();
     if (argc == 5 && !strcmp(argv[1], "--vision-encoder"))
         return check_vision_encoder(argv[2], argv[3], argv[4]);
