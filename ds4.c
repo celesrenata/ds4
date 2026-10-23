@@ -41078,6 +41078,8 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(selected_kv, DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM) \
     X(block_scores, (g->ctx + 7u) / 8u) X(block_selected, 2048) \
     X(block_mask, (g->ctx + 7u) / 8u) \
+    X(candidate_rows, 16384) X(compact_scores, 16384) \
+    X(compact_selected, DS4_N_INDEXER_TOP_K) \
     X(heads, DS4_N_HEAD * DS4_N_HEAD_DIM) X(low, DS4_N_OUT_GROUP * DS4_N_LORA_O) \
     X(route_logits, DS4_N_EXPERT) X(route_probs, DS4_N_EXPERT) \
     X(selected, DS4_N_EXPERT_USED) X(route_weights, DS4_N_EXPERT_USED) \
@@ -41102,6 +41104,7 @@ typedef struct {
     size_t image_count;
     ds4_engram_layout engram;
     ds4_engram_history history;
+    uint32_t candidate_count;
     uint32_t *token_map;
     uint32_t (*prefill_ids)[2][DS4_ENGRAM_COLS];
     ds4_engram_table table[2];
@@ -41558,6 +41561,39 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+static int ds41_candidate_row_cmp(const void *a, const void *b) {
+    const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* Turn the layer-20 block selection into an ascending row list. Ascending
+ * order keeps the tie order of the full-index top-k, so the selected rows are
+ * the same ones the unfiltered path would keep. */
+static bool ds41_build_candidate_rows(ds41_gpu_graph *g, uint32_t n_comp, uint32_t top) {
+    uint32_t ids[2048];
+    if (top == 0u || top > 2048u) return false;
+    /* block_selected is produced in the current command buffer. */
+    if (!ds4_gpu_end_commands()) return false;
+    if (!ds4_gpu_tensor_read(g->block_selected, 0, ids,
+                             (uint64_t)top * sizeof(uint32_t))) return false;
+    qsort(ids, top, sizeof(uint32_t), ds41_candidate_row_cmp);
+    uint32_t rows[16384], n = 0;
+    for (uint32_t b = 0; b < top; b++) {
+        for (uint32_t j = 0; j < 8u; j++) {
+            const uint32_t row = ids[b] * 8u + j;
+            if (row >= n_comp) continue;
+            if (n >= 16384u) return false;
+            rows[n++] = row;
+        }
+    }
+    if (n == 0u) return false;
+    if (!ds4_gpu_tensor_write(g->candidate_rows, 0, rows,
+                              (uint64_t)n * sizeof(uint32_t))) return false;
+    g->candidate_count = n;
+    if (!ds4_gpu_begin_commands()) return false;
+    return true;
+}
+
 static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
@@ -41567,6 +41603,8 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
             if (!ds4_gpu_dsv41_candidate_blocks(g->block_scores, g->index_scores, n_comp, 1, pos, ratio) ||
                 !ds4_gpu_indexer_topk_tensor(g->block_selected, g->block_scores, blocks, 1, top) ||
                 !ds4_gpu_dsv4_topk_mask_tensor(g->block_mask, g->block_selected, blocks, 1, top)) return false;
+            if (getenv("DS4_V41_DISABLE_CANDIDATE_SCORING") == NULL &&
+                !ds41_build_candidate_rows(g, n_comp, top)) return false;
         } else if (il > 20 &&
             !ds4_gpu_dsv41_candidate_filter(g->index_scores, g->block_mask, n_comp, 1, pos, ratio)) return false;
     }
@@ -41590,12 +41628,22 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
         if (!ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true) ||
             !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
             !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
-            !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
+            !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true)) return false;
 #ifdef __APPLE__
-            !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
+        if (il > 20u && g->candidate_count > 0u) {
+            if (!ds4_gpu_glm_indexer_score_rows_tensor(g->compact_scores, g->index_q,
+                    g->index_weights, g->index_cache[owner], g->candidate_rows,
+                    n_comp, g->candidate_count, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f) ||
+                !ds4_gpu_indexer_topk_tensor(g->compact_selected, g->compact_scores,
+                    g->candidate_count, 1, DS4_N_INDEXER_TOP_K) ||
+                !ds4_gpu_indexer_map_rows_tensor(g->selected_comp, g->candidate_rows,
+                    g->compact_selected, DS4_N_INDEXER_TOP_K)) return false;
+            return true;
+        }
+        if (!ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
 #else
-            !ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
+        if (!ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, 1, pos, ratio)) return false;
 #endif
     }
@@ -42221,6 +42269,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     double st_engram_wait_end = 0.0, st_sync_start = 0.0;
     double st_engram_acc = 0.0, st_sync_acc = 0.0;
     uint32_t ids[2][DS4_ENGRAM_COLS];
+    g->candidate_count = 0;
     ds4_engram_history next_history = g->history;
     if (step_timing) st_engram_wait_end = now_sec() * 1000.0;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
