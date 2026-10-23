@@ -42296,7 +42296,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
+    /* Single-host decode would pay a full wait per layer. Committing each
+     * layer's command buffer without waiting keeps the GPU queue fed while
+     * the CPU encodes the next layer; the drains at layer 13 (Engram table
+     * handoff) and at the final layer bound the queue and preserve the buffer
+     * hazards. The disable switch exists for A/B measurements only. */
+#ifdef __APPLE__
+    const bool queue_single = g->tp_world != 2 && !g->streaming && !g->imatrix &&
+        getenv("DS4_METAL_DISABLE_V41_DECODE_PIPELINE") == NULL;
+#else
+    const bool queue_single = false;
+#endif
+    const bool queue_layers = (g->tp_world == 2 || queue_single) && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
     /* Set only once every early-exit path above is behind us. SSD streaming
      * keeps full scoring: the compact path adds a CPU/GPU round trip that has
@@ -42322,7 +42333,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * 14, and before publishing the completed token to the CPU. */
         const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
         if (step_timing) st_sync_start = now_sec() * 1000.0;
-        if (drain && !ds4_gpu_end_commands()) ok = false;
+        if (drain) {
+            if (!ds4_gpu_end_commands()) ok = false;
+        } else if (queue_single && !ds4_gpu_flush_commands()) {
+            ok = false;
+        }
         if (step_timing) st_sync_acc += now_sec() * 1000.0 - st_sync_start;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
