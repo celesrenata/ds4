@@ -42276,7 +42276,6 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     uint32_t ids[2][DS4_ENGRAM_COLS];
     g->candidate_count = 0;
     g->candidate_pos = UINT32_MAX;
-    g->candidate_decode = true;
     ds4_engram_history next_history = g->history;
     if (step_timing) st_engram_wait_end = now_sec() * 1000.0;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
@@ -42299,6 +42298,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
     const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
+    /* Set only once every early-exit path above is behind us. SSD streaming
+     * keeps full scoring: the compact path adds a CPU/GPU round trip that has
+     * not been exercised against the expert cache. */
+    g->candidate_decode = !g->streaming;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
