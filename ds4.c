@@ -75448,8 +75448,18 @@ static bool qwen4_streaming_memory_admit(ds4_engine *e, uint64_t graph_bytes, bo
 
 #ifdef DS4_HAS_DEEPSEEK41_GPU
 static uint64_t ds41_memory_budget(uint64_t host, uint64_t recommended) {
-    const uint64_t budget = host / 8u * 7u;
-    return budget < recommended ? budget : recommended;
+    uint64_t budget = host / 8u * 7u;
+    if (budget > recommended) budget = recommended;
+    /* A user-raised iogpu.wired_limit_mb is an explicit grant: honor it
+     * (minus 2 GiB margin) even above host*7/8, but never past host - 4 GiB. */
+    const uint64_t wired = glm_graph_wired_limit_bytes();
+    const uint64_t margin = UINT64_C(2) << 30, host_reserve = UINT64_C(4) << 30;
+    if (wired > margin && host > host_reserve) {
+        uint64_t granted = wired - margin;
+        if (granted > host - host_reserve) granted = host - host_reserve;
+        if (granted > budget) budget = granted;
+    }
+    return budget;
 }
 
 static uint64_t ds41_fixed_memory(const ds4_engine *e, uint64_t weights, uint64_t graph) {
@@ -75512,6 +75522,17 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
         fprintf(stderr, "ds4: V4.1 needs %.2f GiB before the expert cache; safe budget %.2f GiB. "
                         "Use --ssd-streaming or a smaller context.\n",
                 ds4_bytes_to_gib(fixed), ds4_bytes_to_gib(budget));
+#ifdef __APPLE__
+        if (!e->ssd_streaming && glm_graph_wired_limit_bytes() == 0) {
+            const uint64_t need_mb = (fixed + (UINT64_C(2) << 30) + 1048575u) / 1048576u;
+            fprintf(stderr, "ds4: the Metal cap (%.2f GiB) blocks this resident load. To raise it "
+                            "(resets on reboot): sudo sysctl iogpu.wired_limit_mb=%llu "
+                            "(need >= ~%llu; see docs/ for persistence)\n",
+                    ds4_bytes_to_gib(budget),
+                    (unsigned long long)(host / 1048576u - 10240u),
+                    (unsigned long long)need_mb);
+        }
+#endif
         return false;
     }
     if (expert && e->ssd_streaming_cache_experts > (budget - fixed) / expert) {
