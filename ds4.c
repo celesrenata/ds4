@@ -713,6 +713,7 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
+#ifdef DS4_ENABLE_GLM
 static const ds4_shape DS4_SHAPE_GLM52 = {
     .name = "GLM 5.2",
     .family = DS4_MODEL_FAMILY_GLM_DSA,
@@ -756,6 +757,7 @@ static const ds4_shape DS4_SHAPE_GLM52 = {
     .compress_rope_freq_base = 0.0f,
     .rope_orig_ctx = 1048576,
 };
+#endif /* DS4_ENABLE_GLM */
 
 static const ds4_shape DS4_SHAPE_GLM53 = {
     .name = "GLM 5.3 Flash",
@@ -5457,6 +5459,7 @@ static uint32_t required_u32(const ds4_model *m, const char *key) {
     return v;
 }
 
+#ifdef DS4_ENABLE_GLM
 static uint64_t required_u64_compat(const ds4_model *m, const char *key) {
     uint64_t v = 0;
     if (!model_get_u64_compat(m, key, &v)) {
@@ -5465,6 +5468,7 @@ static uint64_t required_u64_compat(const ds4_model *m, const char *key) {
     }
     return v;
 }
+#endif /* DS4_ENABLE_GLM */
 
 static float required_f32(const ds4_model *m, const char *key) {
     float v = 0.0f;
@@ -7197,12 +7201,14 @@ static void config_expect_u32(const char *name, uint32_t got, uint32_t expected)
     exit(1);
 }
 
+#ifdef DS4_ENABLE_GLM
 static void config_expect_u64(const char *name, uint64_t got, uint64_t expected) {
     if (got == expected) return;
     fprintf(stderr, "ds4: expected %s=%" PRIu64 " for %s, got %" PRIu64 "\n",
             name, expected, DS4_MODEL_SHAPE_NAME, got);
     exit(1);
 }
+#endif /* DS4_ENABLE_GLM */
 
 static void config_expect_f32(const char *name, float got, float expected) {
     const float scale = fabsf(expected) > 1.0f ? fabsf(expected) : 1.0f;
@@ -7368,6 +7374,7 @@ static void config_validate_deepseek4_model(const ds4_model *m) {
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
 }
 
+#ifdef DS4_ENABLE_GLM
 static void config_validate_glm_dsa_model(const ds4_model *m) {
     g_ds4_shape = DS4_SHAPE_GLM52;
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
@@ -7539,6 +7546,7 @@ static void config_validate_glm53_model(const ds4_model *m) {
                       required_f32(m, "glm5-next.hyper_connection.epsilon"), DS4_HC_EPS);
     config_validate_glm53_layer_types(m);
 }
+#endif /* DS4_ENABLE_GLM */
 
 static void config_expect_u32_array(const ds4_model *m, const char *key,
                                     const uint32_t *expected, uint32_t count) {
@@ -7839,6 +7847,7 @@ static void config_validate_model(const ds4_model *m) {
             config_validate_deepseek41_model(m);
             return;
         }
+#ifdef DS4_ENABLE_GLM
         if (ds4_streq(arch, "glm-dsa")) {
             config_validate_glm_dsa_model(m);
             return;
@@ -7847,6 +7856,12 @@ static void config_validate_model(const ds4_model *m) {
             config_validate_glm53_model(m);
             return;
         }
+#else
+        if (ds4_streq(arch, "glm-dsa") || ds4_streq(arch, "glm5-next")) {
+            ds4_die("GLM models are disabled in this build; rebuild with "
+                    "DS4_ENABLE_GLM=1 (see docs/GLM_DISABLED.md)");
+        }
+#endif
         if (ds4_streq(arch, "qwen4exp")) {
             config_validate_qwen4_model(m);
             return;

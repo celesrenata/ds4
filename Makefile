@@ -11,10 +11,22 @@ GLM53_KDA_TEST := tests/test_glm53_kda
 QWEN4_KERNEL_TEST := tests/test_qwen4_kernels
 GLM53_KDA_ROCM_TEST := tests/test_glm53_kda_rocm
 
+# GLM support is DISABLED by default (Apple Metal DeepSeek V4.1 focus).
+# Re-enable with: make DS4_ENABLE_GLM=1   (after `make clean`)
+# This defines DS4_ENABLE_GLM for the C/Objective-C sources (GLM model
+# loading in ds4.c) and re-adds the GLM-only test targets
+# (test-glm53-kda, test-glm-attention, tests/test_glm53_vision_*).
+# See docs/GLM_DISABLED.md.
+DS4_ENABLE_GLM ?= 0
+
 DEBUG_FLAGS ?= -g
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
+ifeq ($(DS4_ENABLE_GLM),1)
+override CFLAGS += -DDS4_ENABLE_GLM
+override OBJCFLAGS += -DDS4_ENABLE_GLM
+endif
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
@@ -974,6 +986,7 @@ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_pr
 ds4_metal.o: ds4_metal.m ds4_metal_device.h ds4.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_image.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
+ifeq ($(DS4_ENABLE_GLM),1)
 tests/test_glm53_kda.o: tests/test_glm53_kda.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_glm53_kda.c
 
@@ -997,6 +1010,7 @@ else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
+endif # DS4_ENABLE_GLM
 tests/test_deepseek4_vision_image.o: tests/test_deepseek4_vision_image.c ds4_image.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
@@ -1009,6 +1023,7 @@ tests/test_image_decode.o: tests/test_image_decode.c ds4_image.h
 tests/test_image_decode: tests/test_image_decode.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+ifeq ($(DS4_ENABLE_GLM),1)
 ifeq ($(UNAME_S),Darwin)
 $(GLM53_KDA_TEST): tests/test_glm53_kda.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
@@ -1020,6 +1035,7 @@ endif
 .PHONY: test-glm53-kda
 test-glm53-kda: $(GLM53_KDA_TEST)
 	./$(GLM53_KDA_TEST)
+endif # DS4_ENABLE_GLM
 
 ifeq ($(UNAME_S),Darwin)
 tests/test_qwen4_kernels.o: tests/test_qwen4_kernels.c ds4_gpu.h ds4.h
@@ -1099,6 +1115,7 @@ test-linux-memory: tests/test_linux_memory
 test-rocm-memory: tests/test_rocm_memory
 	./tests/test_rocm_memory
 
+ifeq ($(DS4_ENABLE_GLM),1)
 tests/test_glm_attention.o: tests/test_glm_attention.c ds4.h ds4_gpu.h ds4_linux_memory.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
 
@@ -1113,6 +1130,7 @@ endif
 .PHONY: test-glm-attention
 test-glm-attention: tests/test_glm_attention
 	./tests/test_glm_attention
+endif # DS4_ENABLE_GLM
 
 tests/test_cuda_tokentile.o: tests/test_cuda_tokentile.c ds4.h ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
