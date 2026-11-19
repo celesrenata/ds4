@@ -3785,6 +3785,26 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
 
 static void server_log(ds4_log_type type, const char *fmt, ...);
 
+/* Render a text span as one log line: newlines/tabs become \n / \t.  The
+ * response log (see generate_job_inner finalize) uses this so a full model
+ * answer stays on a single grep-able line.  Returns dst. */
+static char *log_one_line(const char *src, size_t len, char *dst, size_t dstlen) {
+    size_t o = 0;
+    for (size_t i = 0; i < len && o + 3 < dstlen; i++) {
+        if (src[i] == '\n') {
+            dst[o++] = '\\';
+            dst[o++] = 'n';
+        } else if (src[i] == '\t') {
+            dst[o++] = '\\';
+            dst[o++] = 't';
+        } else {
+            dst[o++] = src[i];
+        }
+    }
+    dst[o] = '\0';
+    return dst;
+}
+
 /* Vision image budget (ds4 PR #1022, ported to the trusted-mask server).
  * Dropping older images is an intentionally lossy policy, so it is opt-in:
  * by default requests with more than SERVER_MAX_IMAGES images are rejected.
@@ -13862,6 +13882,151 @@ static void *decode_worker_main(void *arg) {
     return NULL;
 }
 
+/* ---- repetition loop guard ------------------------------------------------
+ *
+ * A degenerated model (e.g. after an evict -> disk-KV restore -> re-prefill
+ * rebuild) can emit the same span of tokens over and over.  The sampler has
+ * no repetition penalty, so without a guard such a loop runs until the full
+ * output budget: minutes of decode, thousands of garbage tokens.  Two shapes
+ * are caught:
+ *
+ *  1. strict period: the last max(16, 4p) tokens agree with the preceding
+ *     period p (1 <= p <= 64), i.e. the same p-token span repeated 4+ times;
+ *  2. skeleton loop: the same 4-token n-gram appears 5+ times inside the
+ *     last 256 tokens -- catches near-periodic degenerations where the
+ *     skeleton ("This is the task") repeats but filler tokens vary.
+ *
+ * Every generated token is kept in a ring buffer.  On a hit the run is
+ * aborted with finish="error" and a descriptive message (plus a server log
+ * line with the repeated span), so the client sees a clean, retryable error
+ * instead of a multi-minute hang.  Disable with DS4_LOOP_GUARD=0.
+ */
+#define LOOP_GUARD_RING 512
+#define LOOP_GUARD_P_MAX 64
+#define LOOP_GUARD_MIN_SPAN 16
+#define NG_WINDOW 256   /* n-gram scan window (tokens) */
+#define NG_P 4          /* n-gram size */
+#define NG_LIMIT 5      /* hits in-window that trigger the guard */
+#define NG_INTERVAL 16  /* scan cadence (every N tokens) */
+#define NG_TABLE 1024
+
+typedef struct {
+    int toks[LOOP_GUARD_RING];
+    int len;  /* tokens stored (<= RING) */
+    int head; /* next write index */
+} loop_guard;
+
+static bool loop_guard_enabled(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char *v = getenv("DS4_LOOP_GUARD");
+        en = (v && !strcmp(v, "0")) ? 0 : 1;
+    }
+    return en == 1;
+}
+
+static void loop_guard_reset(loop_guard *g) {
+    g->len = 0;
+    g->head = 0;
+}
+
+static void loop_guard_push(loop_guard *g, int tok) {
+    g->toks[g->head] = tok;
+    g->head = (g->head + 1) % LOOP_GUARD_RING;
+    if (g->len < LOOP_GUARD_RING) g->len++;
+}
+
+/* Drop the newest n tokens (speculative rewind discarded them). */
+static void loop_guard_pop(loop_guard *g, int n) {
+    if (n > g->len) n = g->len;
+    g->len -= n;
+}
+
+/* Token at distance d from the tail (0 = newest).  Valid for d < len. */
+static int loop_guard_at(const loop_guard *g, int d) {
+    return g->toks[(g->head - d - 1 + 2 * LOOP_GUARD_RING) % LOOP_GUARD_RING];
+}
+
+/* Smallest p in 1..P_MAX whose period covers the last max(MIN_SPAN, 4p)
+ * tokens; 0 when the tail is not periodic. */
+static int loop_guard_period(const loop_guard *g) {
+    for (int p = 1; p <= LOOP_GUARD_P_MAX; p++) {
+        int span = p * 4;
+        if (span < LOOP_GUARD_MIN_SPAN) span = LOOP_GUARD_MIN_SPAN;
+        if (g->len < span + p) continue;
+        bool ok = true;
+        for (int i = span; i > 0; i--) {
+            if (loop_guard_at(g, i - 1) != loop_guard_at(g, i - 1 + p)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return p;
+    }
+    return 0;
+}
+
+/* Decode an explicit token list into a bounded log snippet. */
+static void loop_guard_tokens_text(server *s, const int *toks, int n,
+                                   char *out, size_t outlen) {
+    size_t pos = 0;
+    out[0] = '\0';
+    for (int i = 0; i < n && pos < outlen - 1; i++) {
+        size_t tn = 0;
+        char *t = ds4_token_text(s->engine, toks[i], &tn);
+        if (!t) continue;
+        size_t room = outlen - 1 - pos;
+        if (tn > room) tn = room;
+        memcpy(out + pos, t, tn);
+        pos += tn;
+        free(t);
+    }
+    out[pos] = '\0';
+}
+
+/* Scan the last NG_WINDOW tokens for the most-repeated NG_P-gram.  Returns the
+ * hit count of the best gram (0 when none reaches NG_LIMIT) and copies that
+ * gram's tokens, in order, into out_tokens[NG_P].  Token-identity is checked
+ * explicitly, so hash collisions cannot produce a false positive. */
+static int loop_guard_gram_repeat(const loop_guard *g, int *out_tokens) {
+    if (g->len < NG_WINDOW) return 0;
+    const int n = NG_WINDOW - NG_P + 1;
+    static uint32_t hashes[NG_WINDOW - NG_P + 1];
+    static int dists[NG_WINDOW - NG_P + 1];
+    for (int i = 0; i < n; i++) {
+        const int si = NG_WINDOW - 1 - i; /* distance from tail of gram start */
+        dists[i] = si;
+        uint32_t h = 2166136261u;
+        for (int k = 0; k < NG_P; k++) {
+            h ^= (uint32_t)loop_guard_at(g, si - k);
+            h *= 16777619u;
+        }
+        hashes[i] = h;
+    }
+    int best = 0, best_i = -1;
+    for (int i = 0; i < n; i++) {
+        int count = 1;
+        for (int j = i + 1; j < n; j++) {
+            if (hashes[j] != hashes[i]) continue;
+            bool same = true;
+            for (int k = 0; k < NG_P; k++) {
+                if (loop_guard_at(g, dists[i] - k) != loop_guard_at(g, dists[j] - k)) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) count++;
+        }
+        if (count > best) {
+            best = count;
+            best_i = i;
+        }
+    }
+    if (best >= NG_LIMIT && best_i >= 0)
+        for (int k = 0; k < NG_P; k++) out_tokens[k] = loop_guard_at(g, dists[best_i] - k);
+    return (best >= NG_LIMIT) ? best : 0;
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -14441,6 +14606,10 @@ decode_again:
     dsml_decode_tracker_init(&dsml_tracker);
     dsml_tracker.model_syntax = j->req.model_syntax;
 
+    loop_guard lg;
+    loop_guard_reset(&lg);
+    const bool loop_guard_on = loop_guard_enabled();
+
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
@@ -14563,6 +14732,45 @@ decode_again:
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
+            if (loop_guard_on) {
+                loop_guard_push(&lg, token);
+                const int p = loop_guard_period(&lg);
+                const bool do_gram = (lg.len % NG_INTERVAL) == 0;
+                int gram = 0, gram_toks[NG_P];
+                if (do_gram) gram = loop_guard_gram_repeat(&lg, gram_toks);
+                if (p > 0 || gram > 0) {
+                    char snippet[256];
+                    int tail_toks[LOOP_GUARD_P_MAX];
+                    if (p > 0) {
+                        for (int k = 0; k < p; k++)
+                            tail_toks[k] = loop_guard_at(&lg, k);
+                        loop_guard_tokens_text(s, tail_toks, p, snippet,
+                                               sizeof(snippet));
+                    } else {
+                        loop_guard_tokens_text(s, gram_toks, NG_P, snippet,
+                                              sizeof(snippet));
+                    }
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: repetition loop guard fired ctx=%s: %s after %d generated tokens; snippet: %.80s... aborting",
+                               ctx_span,
+                               p > 0 ?
+                               "strict period" : "skeleton n-gram repeat",
+                               completion, snippet);
+                    trace_event(s, trace_id,
+                                "loop guard: %s p=%d gram=%d at %d generated; aborting",
+                                p > 0 ? "period" : "ngram", p, gram,
+                                completion);
+                    finish = "error";
+                    snprintf(err, sizeof(err),
+                             "model repetition loop detected (%s at token %d); aborted; please retry or resubmit with a shorter context",
+                             p > 0 ?
+                             "4+ repeats of a short token span" :
+                             "the same 4-token phrase repeating 5+ times",
+                             completion);
+                    stop_decode = true;
+                    break;
+                }
+            }
             const bool was_thinking = thinking.inside;
             if (!dsml_decode_state_is_tool(dsml_tracker.decode))
                 thinking_state_feed(&thinking, piece, piece_len);
@@ -14767,6 +14975,7 @@ decode_again:
                 finish = "error";
                 stop_decode = true;
             } else {
+                if (loop_guard_on) loop_guard_pop(&lg, ntok - kept);
                 trace_event(s, trace_id, "speculative boundary: kept=%d discarded=%d resample=%d rewind_ms=%.3f",
                             kept, ntok - kept, resample, (now_sec() - rewind_t0) * 1000.0);
             }
@@ -15251,6 +15460,37 @@ decode_again:
                        final_finish,
                        now_sec() - t0);
         }
+    }
+    /* Diagnose degenerate / suspicious outputs (e.g. number-soup after a
+     * rebuild) without enabling DEBUG: the full generated text lands on one
+     * grep-able line alongside the finish reason and cache source, so an
+     * incident is explainable from the log alone. */
+    {
+        char *one_line = NULL;
+        size_t cap = text.len + 512;
+        char *buf = (cap > 0) ? xmalloc(cap) : NULL;
+        if (buf) {
+            one_line = log_one_line(text.ptr ? text.ptr : "", text.len, buf, cap);
+        }
+        if (!strcmp(final_finish, "error") && err[0]) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: response ctx=%s gen=%d finish=%s cache=%s error=\"%s\" text=%s",
+                       ctx_span,
+                       completion,
+                       final_finish,
+                       cache_source,
+                       err,
+                       one_line ? one_line : "");
+        } else {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: response ctx=%s gen=%d finish=%s cache=%s text=%s",
+                       ctx_span,
+                       completion,
+                       final_finish,
+                       cache_source,
+                       one_line ? one_line : "");
+        }
+        if (buf) free(buf);
     }
     free(parsed_content);
     free(parsed_reasoning);
