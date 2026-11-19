@@ -1330,6 +1330,12 @@ static int ds4_gpu_pf_entry_stale(uint32_t T, uint32_t etok) {
     return cur >= T;
 }
 
+static int ds4_gpu_packed_expert_redirect(uint64_t *gate_off,
+                                          uint64_t *up_off,
+                                          uint64_t *down_off,
+                                          uint64_t gate_len,
+                                          uint64_t down_len);
+
 static void *ds4_gpu_pf_thread_main(void *arg) {
     (void)arg;
     /* Ask the KERNEL to deprioritise these reads rather than approximating it in
@@ -1442,6 +1448,15 @@ static void *ds4_gpu_pf_thread_main(void *arg) {
         s->lens[1] = g_pf_off[T].gate_bytes;
         s->lens[2] = g_pf_gate_up_only ? 0 : g_pf_off[T].down_bytes;
         if (g_pf_gate_up_only) s->offs[2] = UINT64_MAX;
+        /* The staged slice must come from the same file the demand path will
+         * read it from; with a packed expert file the GGUF region is freed
+         * (zeros) and the stage keys would never match the redirected
+         * demand offsets anyway. */
+        int stage_fd = ds4_gpu_packed_expert_redirect(&s->offs[0],
+                                                      &s->offs[1],
+                                                      &s->offs[2],
+                                                      g_pf_off[T].gate_bytes,
+                                                      g_pf_off[T].down_bytes);
         int ok = 1;
         uint64_t bufpos = 0;
         for (int i = 0; i < 3 && ok; i++) {
@@ -1450,7 +1465,8 @@ static void *ds4_gpu_pf_thread_main(void *arg) {
             if (i != 0 && ds4_gpu_pf_demand_busy()) break;
             uint64_t done = 0;
             while (done < s->lens[i]) {
-                ssize_t nr = pread(g_model_fd, s->buf + bufpos + done,
+                ssize_t nr = pread(stage_fd > 0 ? stage_fd : g_model_fd,
+                                   s->buf + bufpos + done,
                                    (size_t)(s->lens[i] - done),
                                    (off_t)(s->offs[i] + done));
                 if (nr <= 0) { ok = 0; break; }
@@ -18728,21 +18744,34 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
             ds4_gpu_stream_expert_give_back_loads(gate_bufs, up_bufs, down_bufs, gate_inners, batch_reuse);
             return 0;
         }
+        /* A packed expert file may hold these slices; the GGUF region
+         * underneath is freed and reads as zeros.  Redirect to whichever
+         * file actually has them (mirror of the pending-load path). */
+        uint64_t read_gate_off = gate_abs_offsets[slot];
+        uint64_t read_up_off = up_abs_offsets[slot];
+        uint64_t read_down_off = down_abs_offsets[slot];
+        const int read_fd =
+            ds4_gpu_packed_expert_redirect(&read_gate_off, &read_up_off,
+                                           &read_down_off, gate_expert_bytes,
+                                           down_expert_bytes);
         const double task_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
         tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = gate_abs_offsets[slot],
+            .offset = read_gate_off,
             .len = gate_expert_bytes,
             .dst = gate_dst,
+            .read_fd = read_fd,
         };
         tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = up_abs_offsets[slot],
+            .offset = read_up_off,
             .len = gate_expert_bytes,
             .dst = up_dst,
+            .read_fd = read_fd,
         };
         tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = down_abs_offsets[slot],
+            .offset = read_down_off,
             .len = down_expert_bytes,
             .dst = down_dst,
+            .read_fd = read_fd,
         };
         if (load_timing) {
             ds4_gpu_stream_expert_timing_note_prepare_task(
