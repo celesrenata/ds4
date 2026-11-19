@@ -103,8 +103,13 @@ Start with the matching language GGUF and `--vision FILE`; see
 
 OpenAI chat and Responses accept inline PNG/JPEG data URIs. Anthropic accepts
 base64 image sources. Remote URLs and server-side file paths are rejected.
-Image blocks preserve their order in the request. The limit is 16 images and
-a 64 MiB HTTP body.
+Image blocks preserve their order in the request. The limit is 256 images and
+a 64 MiB HTTP body. Agent loops that accumulate more images than a request can
+serve can instead set the environment variable `DS4_VISION_KEEP_IMAGES=N`
+(1 <= N <= 1024) to opt into auto-reduction: the server keeps the last N images
+of the history and serves the request, replacing each dropped image sentinel
+in the transcript with a fixed text note. Unset, the server rejects over-limit
+requests.
 
 ## Disk KV cache
 

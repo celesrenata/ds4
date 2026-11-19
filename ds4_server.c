@@ -3783,6 +3783,120 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
 /* Per-request image cap; session and TP image state is sized dynamically. */
 #define SERVER_MAX_IMAGES 256
 
+static void server_log(ds4_log_type type, const char *fmt, ...);
+
+/* Vision image budget (ds4 PR #1022, ported to the trusted-mask server).
+ * Dropping older images is an intentionally lossy policy, so it is opt-in:
+ * by default requests with more than SERVER_MAX_IMAGES images are rejected.
+ * Setting the environment variable DS4_VISION_KEEP_IMAGES=N
+ * (1 <= N <= DS4_VISION_KEEP_HARD_LIMIT) enables auto-reduction instead: the
+ * OLDEST images are dropped (the freshest views matter most to agent loops)
+ * and each dropped image sentinel in the rendered transcript is replaced by
+ * a fixed text note, so the model still sees an honest history and the
+ * prompt remains a deterministic cache key. The retained set is always the
+ * last N in document order; SERVER_MAX_IMAGES still bounds absurd requests. */
+#define DS4_VISION_KEEP_HARD_LIMIT 1024
+#define DS4_VISION_OMIT_NOTE "[oldest image omitted to fit the vision budget]"
+
+static size_t ds4_vision_keep_cached;   /* 0 = auto-reduce disabled */
+static pthread_once_t ds4_vision_keep_once = PTHREAD_ONCE_INIT;
+
+static void ds4_vision_keep_images_init(void) {
+    const char *env = getenv("DS4_VISION_KEEP_IMAGES");
+    if (!env || !env[0]) return;
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (*end == '\0' && v >= 1 && v <= DS4_VISION_KEEP_HARD_LIMIT) {
+        ds4_vision_keep_cached = (size_t)v;
+    } else {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: ignoring invalid DS4_VISION_KEEP_IMAGES='%s' "
+                   "(valid range 1..%d); auto-reduce stays disabled",
+                   env, DS4_VISION_KEEP_HARD_LIMIT);
+    }
+}
+
+/* Effective auto-reduce target, 0 when disabled. */
+static size_t ds4_vision_keep_images(void) {
+    pthread_once(&ds4_vision_keep_once, ds4_vision_keep_images_init);
+    return ds4_vision_keep_cached;
+}
+
+/* Rewrite r->prompt_text (and r->prompt_trusted in parallel) dropping the
+ * first `dropped` image sentinels, each replaced by the fixed note.
+ * Returns false if a sentinel went missing during rendering. When trusted is
+ * NULL (no mask), only the text is rewritten.
+ *
+ * The mask is the load-bearing part: every kept byte keeps its original
+ * trust bit, so the surviving image sentinels (which contain the control
+ * bytes \x1e/\x1f) stay trusted exactly as the renderer made them. Only the
+ * inserted note region is written untrusted (0) — it is fixed ASCII the
+ * server emitted, never a control token. This keeps
+ * ds4_text_has_untrusted_special from ever seeing a control token at an
+ * untrusted position after the rewrite. */
+static bool ds4_prompt_text_drop_oldest_images(request *r,
+                                                server_image_input **inputs,
+                                                size_t count, size_t dropped) {
+    const char *note = DS4_VISION_OMIT_NOTE;
+    const size_t note_len = strlen(note);
+    const char *src = r->prompt_text;
+    const unsigned char *mask = r->prompt_trusted;
+    const size_t src_len = strlen(src);
+
+    /* Upper bound: keep everything and replace every dropped sentinel with
+     * the note (dropped sentinels are shorter than the note in practice). */
+    size_t cap = src_len + dropped * note_len + 1;
+    char *text = xmalloc(cap);
+    unsigned char *out_mask = NULL;
+    if (mask) {
+        out_mask = xmalloc(cap);
+        /* Unwritten bytes (none expected) default to untrusted. */
+        memset(out_mask, 0, cap);
+    }
+
+    size_t out_len = 0;
+    size_t pos = 0;
+    bool ok = true;
+    for (size_t i = 0; i < count && ok; i++) {
+        const char *marker = src + pos;
+        const char *found = strstr(marker, inputs[i]->marker);
+        if (!found) { ok = false; break; }
+        const size_t mlen = strlen(inputs[i]->marker);
+        const size_t pre = (size_t)(found - marker);
+        memcpy(text + out_len, marker, pre);
+        if (out_mask) memcpy(out_mask + out_len, mask + pos, pre);
+        out_len += pre;
+        const size_t at = out_len;
+        if (i < dropped) {
+            memcpy(text + at, note, note_len);
+            out_len += note_len;
+            if (out_mask) memset(out_mask + at, 0, note_len);
+        } else {
+            memcpy(text + at, found, mlen);
+            out_len += mlen;
+            if (out_mask) memcpy(out_mask + at, mask + pos + pre, mlen);
+        }
+        pos = (size_t)((found + mlen) - src);
+    }
+    if (ok) {
+        const size_t at = out_len;
+        memcpy(text + at, src + pos, src_len - pos);
+        out_len += src_len - pos;
+        if (out_mask) memcpy(out_mask + at, mask + pos, src_len - pos);
+    }
+    if (ok) {
+        text[out_len] = '\0';
+        free(r->prompt_text);
+        free(r->prompt_trusted);
+        r->prompt_text = text;
+        r->prompt_trusted = out_mask;
+    } else {
+        free(text);
+        free(out_mask);
+    }
+    return ok;
+}
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3793,6 +3907,7 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
     }
     r->prompt_ambiguous = ds4_text_has_untrusted_special(e, r->prompt_text,
                                                          r->prompt_trusted);
+    const size_t keep = ds4_vision_keep_images();   /* 0 = reject, not reduce */
     size_t count = 0;
     for (int i = 0; msgs && i < msgs->len; i++) count += msgs->v[i].images.len;
     if (count == 0) {
@@ -3800,8 +3915,16 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         return true;
     }
     if (count > SERVER_MAX_IMAGES) {
-        snprintf(err, errlen, "too many images; at most %d are allowed",
-                 SERVER_MAX_IMAGES);
+        if (keep == 0) {
+            snprintf(err, errlen,
+                     "too many images; at most %d are allowed "
+                     "(set DS4_VISION_KEEP_IMAGES=N to serve the request "
+                     "with the oldest images dropped instead)",
+                     SERVER_MAX_IMAGES);
+        } else {
+            snprintf(err, errlen, "too many images; at most %d are allowed",
+                     SERVER_MAX_IMAGES);
+        }
         return false;
     }
     if (!e || !s || !ds4_engine_has_vision(e)) {
@@ -3810,12 +3933,33 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
     }
 
     server_image_input **inputs = xmalloc(count * sizeof(inputs[0]));
+    server_image_input **inputs_base = inputs;
     ds4_vision_embedding *embeddings = xmalloc(count * sizeof(embeddings[0]));
+    ds4_vision_embedding *embeddings_base = embeddings;
     memset(embeddings, 0, count * sizeof(embeddings[0]));
     size_t next = 0;
     for (int i = 0; i < msgs->len; i++) {
         for (size_t j = 0; j < msgs->v[i].images.len; j++)
             inputs[next++] = &msgs->v[i].images.v[j];
+    }
+
+    size_t total_images = count;
+    if (keep != 0 && count > keep) {
+        const size_t dropped = count - keep;
+        if (!ds4_prompt_text_drop_oldest_images(r, inputs, count, dropped)) {
+            free(inputs_base);
+            free(embeddings_base);
+            snprintf(err, errlen,
+                     "image marker was lost while rendering the request");
+            return false;
+        }
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: kept %zu of %zu images "
+                   "(DS4_VISION_KEEP_IMAGES=%zu)",
+                   keep, total_images, keep);
+        inputs += dropped;
+        embeddings += dropped;
+        count -= dropped;
     }
 
     bool ok = true;
@@ -3863,8 +4007,8 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
 done:
     for (size_t i = 0; i < count; i++)
         ds4_vision_embedding_free(&embeddings[i]);
-    free(embeddings);
-    free(inputs);
+    free(embeddings_base);
+    free(inputs_base);
     if (!ok) {
         ds4_tokens_free(&r->prompt);
         for (size_t i = 0; i < r->image_count; i++)
@@ -23586,6 +23730,72 @@ static void test_special_token_reuse_guards(void) {
 /* json_escape uses buf_printf for \uXXXX control-character escapes.  A
  * tracked buffer must mark those bytes untrusted, even after a reallocation;
  * pre-fill the mask with 0xff so a missing zero-fill cannot pass by luck. */
+static void test_prompt_text_drop_oldest_images_mask(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 64);
+    r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK41;
+    /* Real marker shape: \x1eDS4_IMAGE_<hex>\x1f (no surrounding brackets). */
+    static const char m1[] = "\036DS4_IMAGE_00aa11bb\x1f";
+    static const char m2[] = "\036DS4_IMAGE_22cc33dd\x1f";
+    char text[256];
+    snprintf(text, sizeof(text), "A%sB%sC", m1, m2);
+    r.prompt_text = xstrdup(text);
+    r.prompt_trusted = xmalloc(strlen(r.prompt_text) + 1);
+    memset(r.prompt_trusted, 0, strlen(r.prompt_text) + 1);
+    /* The image sentinels are chat syntax the renderer inserted, so their
+     * bytes (including the \x1e ... \x1f control chars) are trusted. */
+    {
+        const size_t p1 = strlen("A");
+        const size_t p2 = p1 + strlen(m1) + strlen("B");
+        for (size_t i = p1; i < p1 + strlen(m1); i++) r.prompt_trusted[i] = 1;
+        for (size_t i = p2; i < p2 + strlen(m2); i++) r.prompt_trusted[i] = 1;
+    }
+    const size_t orig_len = strlen(r.prompt_text);
+
+    server_image_input imgs[2] = {
+        { .marker = "\036DS4_IMAGE_00aa11bb\x1f" },
+        { .marker = "\036DS4_IMAGE_22cc33dd\x1f" },
+    };
+    server_image_input *inputs[2] = { &imgs[0], &imgs[1] };
+
+    TEST_ASSERT(ds4_prompt_text_drop_oldest_images(&r, inputs, 2, 1));
+
+    /* The dropped sentinel is replaced by the fixed note; the newer one stays. */
+    TEST_ASSERT(strstr(r.prompt_text, DS4_VISION_OMIT_NOTE) != NULL);
+    TEST_ASSERT(strstr(r.prompt_text, m1) == NULL);
+    TEST_ASSERT(strstr(r.prompt_text, m2) != NULL);
+    const size_t new_len = strlen(r.prompt_text);
+
+    /* The mask is exactly as long as the new text (parallel byte mask). */
+    TEST_ASSERT(r.prompt_trusted != NULL);
+    TEST_ASSERT(new_len == orig_len - strlen(m1) + strlen(DS4_VISION_OMIT_NOTE));
+
+    /* Every byte still has a defined trust bit, and the dropped region is
+     * untrusted (0) while the surviving sentinel is still trusted (1). */
+    for (size_t i = 0; i < new_len; i++)
+        TEST_ASSERT(r.prompt_trusted[i] == 0 || r.prompt_trusted[i] == 1);
+    const char *note = strstr(r.prompt_text, DS4_VISION_OMIT_NOTE);
+    const size_t note_start = (size_t)(note - r.prompt_text);
+    for (size_t i = note_start; i < note_start + strlen(DS4_VISION_OMIT_NOTE); i++)
+        TEST_ASSERT(r.prompt_trusted[i] == 0);
+    const char *surv = strstr(r.prompt_text, m2);
+    TEST_ASSERT(r.prompt_trusted[(size_t)(surv - r.prompt_text)] == 1);
+    request_free(&r);
+
+    /* A missing sentinel is an error and leaves the request untouched. */
+    request_init(&r, REQ_CHAT, 64);
+    r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK41;
+    r.prompt_text = xstrdup("just some text, no markers");
+    r.prompt_trusted = xmalloc(strlen(r.prompt_text) + 1);
+    memset(r.prompt_trusted, 0, strlen(r.prompt_text) + 1);
+    const char *before = r.prompt_text;
+    const unsigned char *mask_before = r.prompt_trusted;
+    TEST_ASSERT(!ds4_prompt_text_drop_oldest_images(&r, inputs, 1, 1));
+    TEST_ASSERT(r.prompt_text == before);
+    TEST_ASSERT(r.prompt_trusted == mask_before);
+    request_free(&r);
+}
+
 static void test_buf_printf_mask(void) {
     buf b = {0};
     buf_track_trusted(&b);
@@ -23782,6 +23992,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
     test_special_token_reuse_guards();
     test_buf_printf_mask();
+    test_prompt_text_drop_oldest_images_mask();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
