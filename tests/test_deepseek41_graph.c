@@ -1854,8 +1854,8 @@ done:
     return rc;
 }
 
-/* The resident context fit keeps every shape that already fits, then gives up
- * the wide-prefill carry and prefill width in order before refusing. */
+/* ggml dequantize_row_iq1_s for one row, in double. */
+static void iq1s_dequant_row(const uint8_t *row, uint32_t n, double *y) {
     for (uint32_t b = 0; b < n / QK_K; b++) {
         const block_iq1_s *x = (const block_iq1_s *)(row + (uint64_t)b * sizeof(block_iq1_s));
         const double d = f16_to_f32(x->d);
@@ -2112,7 +2112,8 @@ int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[2], "--batch-head"))
         return check_batch_head(argv[1]);
     if (argc == 2 && !strcmp(argv[1], "--iq1s-routed"))
-        return check_iq1s_routed();    if (argc == 2 && !strcmp(argv[1], "--vision-routing"))
+        return check_iq1s_routed();
+    if (argc == 2 && !strcmp(argv[1], "--vision-routing"))
         return check_vision_routing();
     if (argc == 5 && !strcmp(argv[1], "--vision-encoder"))
         return check_vision_encoder(argv[2], argv[3], argv[4]);
