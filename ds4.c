@@ -74700,13 +74700,17 @@ static bool ds41_memory_need(ds4_engine *e, uint64_t graph_bytes, uint64_t host,
     return !e->ssd_streaming || ds4_streaming_routed_expert_bytes(&e->weights, expert);
 }
 
+static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
+                                      bool fit_cache, uint64_t host,
+                                      uint64_t recommended) {
     if (!host || !recommended) {
         fprintf(stderr, "ds4: cannot determine a safe V4.1 memory budget\n");
         return false;
     }
     uint64_t fixed = 0, budget = 0, expert = 0;
     if (!ds41_memory_need(e, graph_bytes, host, recommended, &fixed, &budget, &expert))
-        return false;    if (fixed >= budget || (expert && budget - fixed < expert)) {
+        return false;
+    if (fixed >= budget || (expert && budget - fixed < expert)) {
         fprintf(stderr, "ds4: V4.1 needs %.2f GiB before the expert cache; safe budget %.2f GiB. "
                         "Use --ssd-streaming or a smaller context.\n",
                 ds4_bytes_to_gib(fixed), ds4_bytes_to_gib(budget));
